@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SAMStars for QGIS</title>
+  <style>
+    body { max-width: 760px; margin: 48px auto; padding: 0 24px; font: 16px/1.6 system-ui, sans-serif; color: #24342d; }
+    h1, h2 { line-height: 1.2; } h2 { margin-top: 2em; }
+    a { color: #17634b; } code { background: #eef3ef; padding: 2px 5px; border-radius: 3px; }
+    li { margin: .4em 0; }
+  </style>
+</head>
+<body>
+  <h1>SAMStars for QGIS</h1>
+  <p>Individual tree crowns from imagery and lidar rasters. Requires QGIS 4.0 or
+    later. This experimental plugin uses the Processing Toolbox for analysis.</p>
+  <nav><a href="#setup">Setup</a> · <a href="#segment">Segment</a> ·
+    <a href="#train">Train</a> · <a href="#checkdependencies">Check dependencies</a></nav>
+
+  <h2 id="setup">Set up the engine</h2>
+  <ol>
+    <li>Open <strong>Plugins → SAMStars → Set up SAMStars</strong>.</li>
+    <li>Select a Python 3.10–3.12 executable and click <strong>Install private engine</strong>.
+      Python must have <code>venv</code> and <code>ensurepip</code> available.</li>
+    <li>Alternatively, select an environment with <code>samstars==0.2.0</code> and
+      click <strong>Use existing</strong>. The environment is checked before selection.</li>
+  </ol>
+  <p>Installation requires internet access and several GB of free space. The
+    installer creates a private environment in the active profile under
+    <code>samstars/engines</code>. QGIS and your base Python are unchanged. Failed
+    installs leave the previous engine selected; successful repairs keep older
+    engines. Keep the base Python installed.</p>
+  <p>Automatic installation supports Linux x64 (Ubuntu 20.04+) and Apple Silicon
+    macOS 14+, following the SAMStars supported platforms. Other platforms need
+    an existing environment and are untested. Linux uses CPU-only PyTorch.
+    For CUDA or MPS, configure a compatible environment using the
+    <a href="https://samstars.sefa.ai/installation/">SAMStars installation guide</a>.
+    The environment variable <code>SAMSTARS_PYTHON</code> overrides the saved Python path.</p>
+
+  <h2>Prepare the scene</h2>
+  <p>Choose local GDAL-readable imagery, a single-band canopy height model in
+    metres, and single-band first-return density. Imagery needs a projected CRS
+    in metres, north-up orientation, and square pixels. Provide a defined CRS
+    and matching coverage for all rasters. SAMStars aligns CHM and density to
+    imagery; survey offsets still need correction beforehand. Density units
+    and cell size must match training. Apply CHM/density scale and offset to
+    pixel values first. Export web services and subdatasets as GeoTIFFs.</p>
+
+  <h2 id="segment">Segment tree crowns</h2>
+  <p>In the Processing Toolbox, run <strong>SAMStars → Segment tree crowns</strong>.
+    Select the three scene rasters and a trained model bundle directory containing
+    <code>manifest.json</code>. Choose a new or empty output folder.</p>
+  <p>The final <code>crowns/crowns.gpkg</code> is loaded into the project and
+    returned as <code>CROWNS</code>. Band choices come from the model. Advanced
+    parameters allow overrides: RGB is a comma-separated list in red, green,
+    blue order, with one-based indices. Blank RGB and zero NIR/texture reuse
+    model settings; zero cannot disable a band stored in the model.</p>
+
+  <h2 id="train">Train a model</h2>
+  <p>Run <strong>SAMStars → Train a model</strong>. Select the three scene rasters,
+    labeled crown polygons, and the SAM ViT-L checkpoint
+    <code>sam_vit_l_0b3195.pth</code> from the
+    <a href="https://github.com/facebookresearch/segment-anything#model-checkpoints">official SAM checkpoint list</a>.
+    Use one valid polygon per tree and fully annotate the scene. Crop to the
+    labeled area, because unlabeled pixels are treated as background.</p>
+  <p>Processing's selected-features option, layer subsets, and unsaved polygon
+    edits are preserved in a temporary GeoPackage. RGB defaults to bands
+    <code>1,2,3</code>. Advanced parameters expose band choices and the SAM/StarDist
+    epoch counts. The new model folder is returned as <code>MODEL</code> and
+    <code>OUTPUT</code>; supply it to segmentation.</p>
+
+  <h2>Storage and compute</h2>
+  <p>CPU is the default. The device setting controls PyTorch proposals, and CPU
+    mode hides CUDA from refinement. TensorFlow manages refinement acceleration
+    independently; custom TensorFlow Metal environments can select their own
+    devices. Start with a small
+    area: large scenes and training can need substantial memory and time.</p>
+  <p>Outputs must be new or empty folders. Intermediate files are removed unless
+    <strong>Keep intermediate files</strong> is checked. Choose a permanent
+    output folder to retain results beyond the session. Cancel stops the worker
+    and its child processes on Linux/macOS; partial output or temporary files
+    can remain. Use a fresh folder for another run. Prepared tiles, resuming,
+    and individual stages are available through the SAMStars Python API.</p>
+
+  <h2 id="checkdependencies">Check dependencies</h2>
+  <p>Run <strong>Check SAMStars dependencies</strong> for an HTML report and
+    Processing log. It checks scientific imports and small CPU operations,
+    including compiled StarDist code, CRS transformation, and GeoPackage I/O.
+    It does not download or validate a trained
+    model and does not certify GPU availability. A failed check includes the
+    underlying error; use setup to select or install a working environment.</p>
+  <p>For <code>No module named venv</code> or missing <code>ensurepip</code>, install
+    your operating system's Python venv support or select a Python installation
+    that provides it. A failed installation never replaces the selected engine.</p>
+</body>
+</html>

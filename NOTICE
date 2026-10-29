@@ -1,0 +1,11 @@
+SAMStars for QGIS is licensed under GPL-3.0-or-later; see LICENSE.
+
+The Processing-provider structure and setup workflow follow PyForestScan for
+QGIS by Nicholas Rogers and Joseph Percival:
+https://github.com/iosefa/pyforestscan-qgis
+
+runtime/client.py is adapted from that project's runtime/client.py, distributed
+under GPL-2.0-or-later. This adaptation is distributed under GPL-3.0-or-later.
+
+The SAMStars library and its scientific dependencies are installed separately
+and retain their own licenses. SAMStars source is not bundled in this plugin.

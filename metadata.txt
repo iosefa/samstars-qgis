@@ -1,0 +1,18 @@
+[general]
+name=SAMStars
+description=Individual tree crown segmentation and model training in the Processing Toolbox.
+about=Train and apply SAMStars models using imagery, canopy heights, and first-return density. Includes a small setup dialog for an isolated Python engine. Requires QGIS 4.0 or later, Python 3.10–3.12 for the engine, and a trained model bundle or SAM ViT-L checkpoint. CPU is the default. See bundled help for installation and platform support.
+version=0.1.0
+qgisMinimumVersion=4.0
+author=Iosefa Percival
+email=ipercival@gmail.com
+license=GPL-3.0-or-later
+category=Analysis
+tags=forestry,tree crowns,segmentation,SAMStars,remote sensing,imagery,lidar
+homepage=https://github.com/iosefa/samstars-qgis
+repository=https://github.com/iosefa/samstars-qgis
+tracker=https://github.com/iosefa/samstars-qgis/issues
+icon=icons/icon.svg
+experimental=True
+deprecated=False
+hasProcessingProvider=yes

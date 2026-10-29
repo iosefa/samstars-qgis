@@ -1,0 +1,256 @@
+"""Standalone worker: never import QGIS or modify QGIS's Python environment."""
+
+import argparse
+from contextlib import contextmanager
+import importlib
+import importlib.metadata
+import json
+import math
+import os
+from pathlib import Path
+import signal
+import sys
+import tempfile
+import traceback
+
+PROTOCOL = 1
+SAMSTARS_VERSION = "0.2.0"
+_DLL_HANDLES = []
+
+
+def emit(message, value=None):
+    event = {"type": "log", "message": str(message)}
+    if value is not None:
+        event.update(type="progress", value=value)
+    print(json.dumps(event), flush=True)
+
+
+def check_dependencies():
+    checks = []
+    modules = {}
+    for distribution, module in (
+        ("samstars", "samstars"), ("torch", "torch"),
+        ("torchvision", "torchvision"), ("tensorflow", "tensorflow"),
+        ("stardist", "stardist.models"), ("csbdeep", "csbdeep"),
+        ("rasterio", "rasterio"), ("geopandas", "geopandas"),
+        ("pyogrio", "pyogrio"), ("numpy", "numpy"),
+        ("scipy", "scipy"), ("scikit-image", "skimage"),
+        ("scikit-learn", "sklearn"), ("segment-anything", "segment_anything"),
+    ):
+        try:
+            version = importlib.metadata.version(distribution)
+            if distribution == "samstars" and version != SAMSTARS_VERSION:
+                raise RuntimeError(f"Found {version}; this plugin requires samstars=={SAMSTARS_VERSION}.")
+            modules[distribution] = importlib.import_module(module)
+            if distribution == "samstars":
+                getattr(modules[distribution], "train")
+                getattr(modules[distribution], "segment")
+            checks.append({"name": distribution, "version": version, "ok": True, "error": ""})
+            emit(f"OK: {distribution} {version}")
+        except Exception as exc:
+            checks.append({"name": distribution, "version": "", "ok": False, "error": str(exc)})
+            emit(f"FAIL: {distribution}: {exc}")
+    if all(item["ok"] for item in checks):
+        labels = modules["numpy"].zeros((16, 16), dtype="uint16")
+        labels[4:12, 4:12] = 1
+        try:
+            torch = modules["torch"]
+            tf = modules["tensorflow"]
+            if (torch.ones((2, 2)) @ torch.ones((2, 2))).sum().item() != 8:
+                raise RuntimeError("PyTorch CPU operation failed.")
+            with tf.device("/CPU:0"):
+                product = tf.matmul(tf.ones((2, 2)), tf.ones((2, 2)))
+                if float(tf.reduce_sum(product)) != 8:
+                    raise RuntimeError("TensorFlow CPU operation failed.")
+            # Exercise the compiled StarDist extension, not only its Python imports.
+            from stardist.geometry import star_dist
+            star_dist(labels, n_rays=8)
+            checks.append({"name": "CPU operations", "version": "", "ok": True, "error": ""})
+        except Exception as exc:
+            checks.append({"name": "CPU operations", "version": "", "ok": False, "error": str(exc)})
+        try:
+            from rasterio.io import MemoryFile
+            from rasterio.transform import from_origin
+            from rasterio.warp import transform_bounds
+            from shapely.geometry import box
+
+            with MemoryFile() as memory:
+                with memory.open(driver="GTiff", width=16, height=16, count=1,
+                                 dtype="uint16", crs="EPSG:32604",
+                                 transform=from_origin(500000, 2200016, 1, 1)) as raster:
+                    raster.write(labels, 1)
+                    transform_bounds(raster.crs, "EPSG:4326", *raster.bounds)
+            frame = modules["geopandas"].GeoDataFrame(
+                {"tree_id": [1]}, geometry=[box(500000, 2200000, 500001, 2200001)], crs="EPSG:32604",
+            )
+            with tempfile.TemporaryDirectory(prefix="samstars-check-") as directory:
+                path = Path(directory) / "crowns.gpkg"
+                frame.to_file(path, driver="GPKG", engine="pyogrio")
+                if len(modules["geopandas"].read_file(path, engine="pyogrio")) != 1:
+                    raise RuntimeError("GeoPackage round trip failed.")
+            checks.append({"name": "Geospatial operations", "version": "", "ok": True, "error": ""})
+        except Exception as exc:
+            checks.append({"name": "Geospatial operations", "version": "", "ok": False, "error": str(exc)})
+    return {"ready": all(item["ok"] for item in checks), "checks": checks, "python_version": sys.version.split()[0]}
+
+
+def validate_output(path, inputs):
+    """Reject reuse and containment before SAMStars can replace final outputs."""
+    output = Path(path).expanduser().resolve()
+    for value in inputs:
+        source = Path(value).resolve()
+        if output == source or output in source.parents or (source.is_dir() and source in output.parents):
+            raise ValueError("Output must be separate from input files and the model bundle.")
+    if output.exists() and (not output.is_dir() or any(output.iterdir())):
+        raise ValueError("Choose a new or empty output folder. Existing runs are never overwritten.")
+    return output
+
+
+@contextmanager
+def claim_output(output):
+    """Avoid two Processing jobs writing to the same new destination."""
+    output.mkdir(parents=True, exist_ok=True)
+    marker = output / ".samstars-running"
+    try:
+        with marker.open("x", encoding="utf-8") as stream:
+            stream.write(str(os.getpid()))
+    except FileExistsError as exc:
+        raise ValueError("Another SAMStars run is using this output folder. Choose a new folder.") from exc
+    try:
+        if any(path != marker for path in output.iterdir()):
+            raise ValueError("Output folder is no longer empty. Choose a new folder.")
+        yield
+    finally:
+        marker.unlink(missing_ok=True)
+
+
+def validate_rasters(payload, defaults=None):
+    import rasterio
+    from rasterio.warp import transform_bounds
+
+    defaults = defaults or {}
+    with rasterio.open(payload["img"]) as image:
+        if not image.crs or not image.crs.is_projected:
+            raise ValueError("Imagery needs a projected CRS in metres. Reproject it before running SAMStars.")
+        if not math.isclose(image.crs.linear_units_factor[1], 1.0):
+            raise ValueError("The imagery CRS must use metres.")
+        transform = image.transform
+        if transform.b != 0 or transform.d != 0 or transform.a <= 0 or transform.e >= 0 or not math.isclose(transform.a, -transform.e, rel_tol=1e-6):
+            raise ValueError("Imagery must be north-up with square pixels. Warp it to a square grid first.")
+        bands = payload.get("rgb_bands") or defaults.get("rgb_bands") or [1, 2, 3]
+        if len(bands) != 3 or len(set(bands)) != 3:
+            raise ValueError("RGB bands must contain three distinct indices in red, green, blue order.")
+        for name in ("nir_band", "texture_band"):
+            value = payload.get(name) or defaults.get(name)
+            if value is not None:
+                bands = [*bands, value]
+        if any(not isinstance(band, int) or not 1 <= band <= image.count for band in bands):
+            raise ValueError(f"Selected image bands exceed the available {image.count} bands.")
+        for key, label in (("chm", "Canopy height"), ("den", "First-return density")):
+            with rasterio.open(payload[key]) as raster:
+                if raster.count != 1 or not raster.crs:
+                    raise ValueError(f"{label} must be a single-band raster with a defined CRS.")
+                if raster.scales[0] != 1 or raster.offsets[0] != 0:
+                    raise ValueError(f"Apply the {label.lower()} band scale/offset before processing.")
+                if key == "chm" and raster.units[0] and raster.units[0].lower() not in ("m", "metre", "metres", "meter", "meters"):
+                    raise ValueError("Canopy heights must store values in metres.")
+                bounds = transform_bounds(raster.crs, image.crs, *raster.bounds)
+                if bounds[0] >= image.bounds.right or bounds[2] <= image.bounds.left or bounds[1] >= image.bounds.top or bounds[3] <= image.bounds.bottom:
+                    raise ValueError(f"{label} does not overlap the imagery.")
+
+
+def run_job(operation, payload):
+    if not (3, 10) <= sys.version_info[:2] <= (3, 12):
+        raise RuntimeError("The SAMStars engine requires Python 3.10–3.12.")
+    if operation == "check":
+        return check_dependencies()
+    if operation not in ("train", "segment"):
+        raise ValueError(f"Unknown operation: {operation}")
+    version = importlib.metadata.version("samstars")
+    if version != SAMSTARS_VERSION:
+        raise RuntimeError(f"This plugin requires samstars=={SAMSTARS_VERSION}; found {version}.")
+    import samstars
+
+    arguments = dict(payload)
+    inputs = [arguments[key] for key in ("img", "chm", "den")]
+    inputs += [arguments[key] for key in ("model", "sam_base_ckpt", "crowns") if key in arguments]
+    arguments["out"] = validate_output(arguments["out"], inputs)
+    defaults = {}
+    if operation == "segment":
+        model = samstars.SamStars.load(Path(arguments["model"]))
+        defaults = model.defaults
+        if model.manifest.get("bundle_version") != 1:
+            raise ValueError("Unsupported model bundle version; use a SAMStars 0.2.0 bundle.")
+    validate_rasters(arguments, defaults)
+    for name in ("img", "chm", "den", "model", "sam_base_ckpt", "crowns"):
+        if name in arguments:
+            arguments[name] = Path(arguments[name])
+    if arguments.get("rgb_bands"):
+        arguments["rgb_bands"] = tuple(arguments["rgb_bands"])
+    device = arguments.get("device", "cpu")
+    if device not in ("cpu", "cuda", "mps"):
+        raise ValueError("Device must be cpu, cuda, or mps.")
+    import torch
+
+    if device == "cuda" and not torch.cuda.is_available():
+        raise ValueError("CUDA is unavailable in this engine. Select CPU or configure a CUDA environment in setup.")
+    if device == "mps" and not torch.backends.mps.is_available():
+        raise ValueError("MPS is unavailable in this engine. Select CPU or use Apple Silicon with an MPS-enabled PyTorch.")
+    arguments["stardist_cpu"] = device == "cpu"
+    emit("Running SAMStars. Stage logs follow; large scenes can take a long time.", 5)
+    with claim_output(arguments["out"]):
+        if operation == "train":
+            result = samstars.train(**arguments)
+            manifest = Path(result.root) / "manifest.json"
+            if not manifest.is_file():
+                raise RuntimeError("Training completed without a model manifest.")
+            output = {"OUTPUT": str(result.root), "MODEL": str(result.root)}
+        else:
+            result = samstars.segment(**arguments)
+            if not Path(result.crowns).is_file():
+                raise RuntimeError("Segmentation produced no crown GeoPackage. Check input coverage and the stage logs.")
+            output = {"OUTPUT": str(result.out), "CROWNS": str(result.crowns)}
+    emit("SAMStars finished.", 100)
+    return output
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--request", required=True)
+    parser.add_argument("--result", required=True)
+    args = parser.parse_args(argv)
+    if os.name == "nt" and hasattr(os, "add_dll_directory"):
+        for relative in ("Library/bin", "DLLs"):
+            directory = Path(sys.prefix) / relative
+            if directory.is_dir():
+                _DLL_HANDLES.append(os.add_dll_directory(str(directory)))
+
+    def terminated(signum, frame):
+        raise InterruptedError("SAMStars processing canceled.")
+
+    signal.signal(signal.SIGTERM, terminated)
+    try:
+        request = json.loads(Path(args.request).read_text(encoding="utf-8"))
+        if not isinstance(request, dict) or request.get("protocol") != PROTOCOL:
+            raise ValueError("Unsupported worker protocol.")
+        if not isinstance(request.get("payload"), dict):
+            raise ValueError("Worker payload must be an object.")
+        # Disable accelerators before TensorFlow/PyTorch are imported for CPU jobs.
+        if request.get("operation") == "check" or request["payload"].get("device", "cpu") == "cpu":
+            os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+        result = run_job(request.get("operation"), request["payload"])
+        document = {"protocol": PROTOCOL, "ok": True, "result": result}
+        code = 0
+    except Exception as exc:
+        traceback.print_exc(file=sys.stderr)
+        document = {"protocol": PROTOCOL, "ok": False, "error": {"message": str(exc)}}
+        code = 1
+    path = Path(args.result)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(document, allow_nan=False), encoding="utf-8")
+    os.replace(temporary, path)
+    return code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
