@@ -3,6 +3,7 @@ import gc
 from pathlib import Path
 import sys
 import tempfile
+import time
 import types
 import unittest
 from unittest.mock import MagicMock, patch
@@ -92,7 +93,7 @@ class QgisTests(unittest.TestCase):
         algorithm.initAlgorithm()
         return algorithm
 
-    def test_provider_registers_exactly_three_tools_without_ml_imports(self):
+    def test_provider_registers_eight_tools_without_ml_imports(self):
         from samstars_qgis.provider import SamStarsProvider
         before = set(sys.modules)
         provider = SamStarsProvider()
@@ -101,9 +102,13 @@ class QgisTests(unittest.TestCase):
         try:
             self.assertEqual({algorithm.id() for algorithm in provider.algorithms()}, {
                 "samstars:segment", "samstars:train", "samstars:checkdependencies",
+                "samstars:alignrasters", "samstars:costsurface", "samstars:generateseeds",
+                "samstars:proposals", "samstars:refine",
             })
             for algorithm in provider.algorithms():
                 self.assertTrue(Path(algorithm.helpUrl().split("#")[0].removeprefix("file://")).is_file())
+                if algorithm.name() in {"alignrasters", "costsurface", "generateseeds", "proposals", "refine"}:
+                    self.assertEqual(algorithm.group(), "Workflow steps")
             self.assertFalse({"torch", "tensorflow", "samstars"} & (set(sys.modules) - before))
         finally:
             registry.removeProvider(provider)
@@ -224,6 +229,105 @@ class QgisTests(unittest.TestCase):
                 self.segment().processAlgorithm(self.parameters, self.context, self.feedback)
             engine.assert_not_called()
 
+    def test_preparation_steps_apply_defaults_and_load_outputs(self):
+        from samstars_qgis.algorithms.steps import AlignRastersAlgorithm, CostSurfaceAlgorithm, SeedsAlgorithm
+        cases = (
+            (AlignRastersAlgorithm, {"REFERENCE_IMAGE": "img.tif", "ALIGNED_CHM": "chm.tif", "ALIGNED_DENSITY": "den.tif"}, ("chm.tif", "den.tif")),
+            (CostSurfaceAlgorithm, {"COST": "cost.tif"}, ("cost.tif",)),
+            (SeedsAlgorithm, {"SEEDS": "seeds.gpkg"}, ("seeds.gpkg",)),
+        )
+        for cls, outputs, layers in cases:
+            with self.subTest(step=cls.__name__):
+                algorithm = cls()
+                algorithm.initAlgorithm()
+                params = {**self.parameters, "COST": self.parameters["CHM"]}
+                with patch("samstars_qgis.algorithms.common.call_engine", return_value={"OUTPUT": params["OUTPUT"], **outputs}) as engine:
+                    result, ok = algorithm.run(params, self.context, self.feedback)
+                self.assertTrue(ok)
+                operation, payload, _ = engine.call_args.args
+                self.assertEqual(operation, algorithm.name())
+                self.assertEqual(payload["chm"], str(self.root / "CHM.tif"))
+                for layer in layers:
+                    self.assertIn(layer, self.context.layersToLoadOnCompletion())
+                if cls is CostSurfaceAlgorithm:
+                    self.assertEqual(payload["weights"], [.4, .3, .3])
+                    self.assertEqual(payload["rgb_bands"], [1, 2, 3])
+                if cls is SeedsAlgorithm:
+                    self.assertEqual(payload["seed_settings"]["d_min"], 4.5)
+                    self.assertEqual(payload["seed_settings"]["min_dist_px"], 4)
+                    self.assertEqual(payload["thin_distance"], .8)
+
+    def test_proposals_use_selected_unsaved_seed_edits(self):
+        from samstars_qgis.algorithms.steps import ProposalsAlgorithm
+        seeds = QgsVectorLayer("Point?crs=EPSG:32604&field=tree_id:integer", "Seeds", "memory")
+        seeds.startEditing()
+        ids = []
+        for index in (1, 2):
+            feature = QgsFeature(seeds.fields())
+            feature["tree_id"] = index
+            feature.setGeometry(QgsGeometry.fromWkt(f"POINT({500000 + index} 2200003)"))
+            self.assertTrue(seeds.addFeature(feature))
+            ids.append(feature.id())
+        moved = QgsGeometry.fromWkt("POINT(500009 2200007)")
+        self.assertTrue(seeds.changeGeometry(ids[0], moved))
+        seeds.selectByIds([ids[0]])
+        self.project.addMapLayer(seeds)
+        algorithm = ProposalsAlgorithm()
+        algorithm.initAlgorithm()
+        params = {**self.parameters, "COST": self.parameters["CHM"],
+                  "SEEDS": QgsProcessingFeatureSourceDefinition(seeds.id(), True), "CROP_SMOOTHING": 1.5}
+        outputs = {"OUTPUT": params["OUTPUT"], "PROPOSAL_RECORDS": "records.json", "PROBABILITY": "prob.tif", "CANOPY_INDEX": "index.tif"}
+        with patch("samstars_qgis.algorithms.common.call_engine", return_value=outputs) as engine:
+            result, ok = algorithm.run(params, self.context, self.feedback)
+        self.assertTrue(ok)
+        self.assertEqual(result, outputs)
+        self.assertEqual(engine.call_args.args[0], "proposals")
+        payload = engine.call_args.args[1]
+        exported = QgsVectorLayer(payload["seeds"], "exported", "ogr")
+        self.assertEqual(exported.featureCount(), 1)
+        feature = next(exported.getFeatures())
+        self.assertEqual(feature["tree_id"], 1)
+        self.assertEqual(feature.geometry().asWkt(), moved.asWkt())
+        self.assertTrue(seeds.isEditable())
+        self.assertEqual(payload["device"], "cpu")
+        self.assertEqual(payload["crop_smooth_sigma"], 1.5)
+        self.assertNotIn("rgb_bands", payload)
+        self.assertNotIn("smooth_sigma", payload)
+        self.assertNotIn("den", payload)
+        self.assertIn("prob.tif", self.context.layersToLoadOnCompletion())
+
+    def test_proposals_reject_empty_seed_selection(self):
+        from samstars_qgis.algorithms.steps import ProposalsAlgorithm
+        layer = QgsVectorLayer("Point?crs=EPSG:32604", "Seeds", "memory")
+        self.project.addMapLayer(layer)
+        algorithm = ProposalsAlgorithm()
+        algorithm.initAlgorithm()
+        with self.assertRaisesRegex(QgsProcessingException, "at least one"):
+            algorithm.export_seeds({"SEEDS": layer.id()}, self.context, self.feedback)
+
+    def test_refinement_defaults_overrides_and_output_loading(self):
+        from samstars_qgis.algorithms.steps import RefineAlgorithm
+        records = self.root / "proposal_records.json"
+        records.write_text("[]")
+        algorithm = RefineAlgorithm()
+        algorithm.initAlgorithm()
+        params = {**self.parameters, "PROPOSAL_RECORDS": str(records)}
+        outputs = {"OUTPUT": params["OUTPUT"], "CROWNS": "refined.gpkg"}
+        with patch("samstars_qgis.algorithms.common.call_engine", return_value=outputs) as engine:
+            _, ok = algorithm.run(params, self.context, self.feedback)
+        self.assertTrue(ok)
+        payload = engine.call_args.args[1]
+        self.assertEqual(engine.call_args.args[0], "refine")
+        self.assertNotIn("stardist_prob_thr", payload)
+        self.assertNotIn("stardist_window_size_m", payload)
+        self.assertIn(outputs["CROWNS"], self.context.layersToLoadOnCompletion())
+        with self.assertRaisesRegex(QgsProcessingException, "both refinement thresholds"):
+            algorithm.processAlgorithm({**params, "PROB_THRESHOLD": .4}, self.context, self.feedback)
+        with patch("samstars_qgis.algorithms.common.call_engine", return_value=outputs) as engine:
+            _, ok = algorithm.run({**params, "PROB_THRESHOLD": .4, "NMS_THRESHOLD": .3, "WINDOW_SIZE": 50}, self.context, self.feedback)
+        self.assertTrue(ok)
+        self.assertEqual(engine.call_args.args[1]["stardist_window_size_m"], 50)
+
     def test_dependency_report_survives_missing_engine_and_escapes_html(self):
         from samstars_qgis.algorithms.dependency_check import DependencyCheckAlgorithm
         from samstars_qgis.runtime.client import EngineError
@@ -239,9 +343,216 @@ class QgisTests(unittest.TestCase):
         from samstars_qgis.setup_dialog import SetupDialog
         dialog = SetupDialog()
         try:
-            self.assertEqual(dialog.windowTitle(), "SAMStars setup")
-            self.assertFalse(dialog.cancel.isEnabled())
+            self.assertEqual(dialog.windowTitle(), "SAMStars Setup")
+            self.assertFalse(dialog.cancel_button.isEnabled())
+            self.assertTrue(dialog.advanced.isCollapsed())
+            self.assertIn(dialog.install_button.text(), ("Install engine", "Repair engine"))
+            self.assertEqual(dialog.remove_button.text(), "Remove engine")
+            from qgis.PyQt.QtWidgets import QLabel
+            self.assertFalse(any("0.2.0" in label.text() for label in dialog.findChildren(QLabel)))
             self.assertIsNone(dialog._thread)
+            self.assertTrue(dialog.gpu_button.isEnabled())
+        finally:
+            dialog.close()
+
+    def test_gpu_dialog_blocks_unsupported_install_but_can_test_existing_engine(self):
+        from samstars_qgis.setup_dialog import GpuSetupDialog
+        state = {"installed": True, "override": False, "error": "", "accelerator": "cpu"}
+        with patch("samstars_qgis.setup_dialog.accelerators.platform_error", return_value="Unsupported platform"):
+            dialog = GpuSetupDialog(state)
+            try:
+                dialog.device.setCurrentIndex(dialog.device.findData("cuda"))
+                self.assertFalse(dialog.install_button.isEnabled())
+                self.assertTrue(dialog.test_button.isEnabled())
+                self.assertIn("Unsupported platform", dialog.details.text())
+            finally:
+                dialog.close()
+
+    def test_gpu_dialog_explains_refinement_and_respects_environment_override(self):
+        from samstars_qgis.setup_dialog import GpuSetupDialog
+        from qgis.PyQt.QtWidgets import QLabel
+        state = {"installed": True, "override": True, "error": "", "accelerator": "cuda"}
+        dialog = GpuSetupDialog(state)
+        try:
+            self.assertFalse(dialog.install_button.isEnabled())
+            self.assertTrue(dialog.test_button.isEnabled())
+            self.assertIn("SAMSTARS_PYTHON", dialog.details.text())
+            self.assertTrue(any("StarDist refinement stays on CPU" in label.text() for label in dialog.findChildren(QLabel)))
+        finally:
+            dialog.close()
+
+    def test_gpu_diagnostic_success_never_changes_selected_environment(self):
+        from samstars_qgis.setup_dialog import SetupDialog
+        dialog = SetupDialog()
+        try:
+            dialog._diagnosing = True
+            with patch("samstars_qgis.setup_dialog.QgsSettings") as settings:
+                dialog._succeeded({"ready": True, "hardware": "GPU", "refinement": "cpu", "checks": []})
+                settings.assert_not_called()
+            dialog._finished()
+            self.assertIn("GPU test passed", dialog.message.text())
+            self.assertEqual(dialog.progress_bar.value(), 100)
+        finally:
+            dialog.close()
+
+    def test_repair_preserves_gpu_profile_and_cpu_can_be_selected_explicitly(self):
+        from samstars_qgis.setup_dialog import SetupDialog
+        dialog = SetupDialog()
+        try:
+            with patch("samstars_qgis.setup_dialog.manager.status", return_value={"managed": True, "accelerator": "cuda"}), \
+                 patch("samstars_qgis.setup_dialog.manager.install_engine") as installer, \
+                 patch.object(dialog, "_start", side_effect=lambda operation: operation()):
+                dialog._install()
+                self.assertEqual(installer.call_args.kwargs["accelerator"], "cuda")
+                dialog._install(accelerator="cpu")
+                self.assertEqual(installer.call_args.kwargs["accelerator"], "cpu")
+        finally:
+            dialog.close()
+
+    def test_gpu_button_uses_diagnostic_operation_without_installing(self):
+        from samstars_qgis.setup_dialog import SetupDialog
+        from qgis.PyQt.QtWidgets import QDialog
+        dialog = SetupDialog()
+        try:
+            with patch("samstars_qgis.setup_dialog.manager.status", return_value={"python": "/tmp/selected/python"}), \
+                 patch("samstars_qgis.setup_dialog.GpuSetupDialog") as gpu_dialog, \
+                 patch("samstars_qgis.setup_dialog.manager.check_gpu", return_value={}) as check, \
+                 patch("samstars_qgis.setup_dialog.manager.install_engine") as installer, \
+                 patch.object(dialog, "_start", side_effect=lambda operation, **kwargs: operation()) as start:
+                gpu_dialog.return_value.exec.return_value = QDialog.DialogCode.Accepted
+                gpu_dialog.return_value.device.currentData.return_value = "cuda"
+                gpu_dialog.return_value.operation = "test"
+                dialog._gpu_setup()
+                check.assert_called_once_with("/tmp/selected/python", "cuda")
+                installer.assert_not_called()
+                self.assertTrue(start.call_args.kwargs["diagnosing"])
+        finally:
+            dialog.close()
+
+    def test_setup_failure_stays_visible_and_does_not_show_completion(self):
+        from samstars_qgis.setup_dialog import SetupDialog
+        dialog = SetupDialog()
+        try:
+            with patch("samstars_qgis.setup_dialog.QgsSettings") as settings:
+                dialog._failed("The selected Python could not start.", False)
+                dialog._finished()
+                settings.assert_not_called()
+            self.assertIn("could not start", dialog.message.text())
+            self.assertFalse(dialog.advanced.isCollapsed())
+            self.assertEqual(dialog.progress_bar.value(), 0)
+            self.assertFalse(dialog.cancel_button.isEnabled())
+        finally:
+            dialog.close()
+
+    def test_setup_success_saves_only_validated_interpreter(self):
+        from samstars_qgis.setup_dialog import SetupDialog
+        from samstars_qgis.runtime import manager
+        dialog = SetupDialog()
+        try:
+            with patch("samstars_qgis.setup_dialog.QgsSettings") as settings:
+                dialog._succeeded({"python": "/tmp/validated/bin/python"})
+                settings.return_value.setValue.assert_called_once_with(
+                    manager.SETTING, "/tmp/validated/bin/python",
+                )
+            dialog._finished()
+            self.assertEqual(dialog.progress_bar.value(), 100)
+            self.assertIn("Engine ready", dialog.message.text())
+        finally:
+            dialog.close()
+
+    def test_setup_uses_repair_for_managed_engine_and_respects_override(self):
+        from samstars_qgis.setup_dialog import SetupDialog
+        state = {
+            "installed": True, "managed": True, "python": "/tmp/engine/bin/python",
+            "path": "/tmp/engines", "platform": "Linux x86_64", "removable": True,
+            "override": False, "error": "",
+        }
+        with patch("samstars_qgis.setup_dialog.manager.status", return_value=state):
+            dialog = SetupDialog()
+            try:
+                self.assertEqual(dialog.install_button.text(), "Repair engine")
+                self.assertTrue(dialog.remove_button.isEnabled())
+                state["override"] = True
+                dialog._refresh()
+                self.assertFalse(dialog.install_button.isEnabled())
+                self.assertFalse(dialog.existing_button.isEnabled())
+                self.assertFalse(dialog.remove_button.isEnabled())
+                self.assertIn("SAMSTARS_PYTHON", dialog.message.text())
+            finally:
+                dialog.close()
+
+    def test_setup_thread_reports_progress_and_validates_before_activation(self):
+        from qgis.PyQt.QtTest import QTest
+        from samstars_qgis.setup_dialog import SetupDialog
+        from samstars_qgis.runtime import manager
+        dialog = SetupDialog()
+
+        def operation(*, event, cancel):
+            event({"type": "progress", "value": 45, "message": "Installing libraries"})
+            event({"type": "log", "message": "Validation passed"})
+            return {"python": "/tmp/validated/bin/python"}
+
+        try:
+            with patch("samstars_qgis.setup_dialog.QgsSettings") as settings:
+                dialog._start(operation)
+                deadline = time.monotonic() + 5
+                while dialog._thread is not None and time.monotonic() < deadline:
+                    QTest.qWait(10)
+                self.assertIsNone(dialog._thread)
+                settings.return_value.setValue.assert_called_once_with(
+                    manager.SETTING, "/tmp/validated/bin/python",
+                )
+                self.assertEqual(dialog.progress_bar.value(), 100)
+                self.assertIn("Validation passed", dialog.log.toPlainText())
+        finally:
+            if dialog._thread is not None:
+                dialog._thread.cancel_event.set()
+                dialog._thread.wait(2000)
+                QTest.qWait(10)
+            dialog.close()
+
+    def test_setup_close_cancels_worker_without_changing_selection(self):
+        from qgis.PyQt.QtTest import QTest
+        from samstars_qgis.setup_dialog import SetupDialog
+        from samstars_qgis.runtime.client import EngineCanceled
+        dialog = SetupDialog()
+
+        def operation(*, event, cancel):
+            while not cancel():
+                time.sleep(0.01)
+            raise EngineCanceled("Setup canceled.")
+
+        try:
+            with patch("samstars_qgis.setup_dialog.QgsSettings") as settings:
+                dialog._start(operation)
+                dialog.reject()
+                deadline = time.monotonic() + 5
+                while dialog._thread is not None and time.monotonic() < deadline:
+                    QTest.qWait(10)
+                self.assertIsNone(dialog._thread)
+                settings.assert_not_called()
+                self.assertEqual(dialog.progress_bar.value(), 0)
+                self.assertIn("canceled", dialog.message.text())
+        finally:
+            if dialog._thread is not None:
+                dialog._thread.cancel_event.set()
+                dialog._thread.wait(2000)
+                QTest.qWait(10)
+            dialog.close()
+
+    def test_setup_removal_clears_only_a_removed_selection(self):
+        from samstars_qgis.setup_dialog import SetupDialog
+        from samstars_qgis.runtime import manager
+        dialog = SetupDialog()
+        try:
+            with patch("samstars_qgis.setup_dialog.QgsSettings") as settings:
+                settings.return_value.value.return_value = "/tmp/private-engine/bin/python"
+                dialog._succeeded({"removed": ["/tmp/private-engine"]})
+                settings.return_value.remove.assert_called_once_with(manager.SETTING)
+            with patch("samstars_qgis.setup_dialog.QgsSettings") as settings:
+                settings.return_value.value.return_value = "/tmp/external-env/bin/python"
+                dialog._succeeded({"removed": ["/tmp/private-engine"]})
+                settings.return_value.remove.assert_not_called()
         finally:
             dialog.close()
 

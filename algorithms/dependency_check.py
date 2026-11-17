@@ -27,7 +27,8 @@ class DependencyCheckAlgorithm(SamStarsAlgorithm):
             "Check the configured Python engine, SAMStars version, scientific imports, and small "
             "CPU, raster, and GeoPackage operations. No models are downloaded. A successful check does not validate a "
             "trained model or GPU drivers. Use Plugins → SAMStars → Set up SAMStars to install "
-            "a private engine or select an existing environment."
+            "a private engine or select an existing environment. GPU setup → Test selected engine checks "
+            "PyTorch GPU computation separately; private engines keep StarDist refinement on CPU."
         )
 
     def initAlgorithm(self, config=None):

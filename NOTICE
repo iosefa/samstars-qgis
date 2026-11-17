@@ -4,6 +4,9 @@ The Processing-provider structure and setup workflow follow PyForestScan for
 QGIS by Nicholas Rogers and Joseph Percival:
 https://github.com/iosefa/pyforestscan-qgis
 
+The compact engine setup layout also follows Coregix for QGIS:
+https://github.com/iosefa/coregix-qgis
+
 runtime/client.py is adapted from that project's runtime/client.py, distributed
 under GPL-2.0-or-later. This adaptation is distributed under GPL-3.0-or-later.
 

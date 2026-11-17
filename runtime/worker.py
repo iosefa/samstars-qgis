@@ -4,6 +4,7 @@ import argparse
 from contextlib import contextmanager
 import importlib
 import importlib.metadata
+import importlib.util
 import json
 import math
 import os
@@ -15,7 +16,21 @@ import traceback
 
 PROTOCOL = 1
 SAMSTARS_VERSION = "0.2.0"
+PROFILE_FILE = ".samstars-runtime.json"
 _DLL_HANDLES = []
+
+
+def engine_profile():
+    path = Path(sys.prefix) / PROFILE_FILE
+    if not path.is_file():
+        return {}
+    try:
+        profile = json.loads(path.read_text(encoding="utf-8"))
+        if profile["device"] not in ("cpu", "cuda", "mps") or profile["refinement"] != "cpu":
+            raise ValueError("Unsupported profile")
+        return profile
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        raise RuntimeError("Private engine settings are invalid. Repair the engine in SAMStars Setup.") from exc
 
 
 def emit(message, value=None):
@@ -42,6 +57,9 @@ def check_dependencies():
             if distribution == "samstars" and version != SAMSTARS_VERSION:
                 raise RuntimeError(f"Found {version}; this plugin requires samstars=={SAMSTARS_VERSION}.")
             modules[distribution] = importlib.import_module(module)
+            if distribution == "tensorflow":
+                # A CPU validation must also stay on CPU with a Metal plugin.
+                modules[distribution].config.set_visible_devices([], "GPU")
             if distribution == "samstars":
                 getattr(modules[distribution], "train")
                 getattr(modules[distribution], "segment")
@@ -92,6 +110,61 @@ def check_dependencies():
         except Exception as exc:
             checks.append({"name": "Geospatial operations", "version": "", "ok": False, "error": str(exc)})
     return {"ready": all(item["ok"] for item in checks), "checks": checks, "python_version": sys.version.split()[0]}
+
+
+def _torch_gpu_operations(torch, device):
+    """Small forward/backward kernels; availability alone is not validation."""
+    values = torch.ones((4, 4), device=device, requires_grad=True)
+    product = values @ values
+    if product.device.type != device or not torch.allclose(product, torch.full_like(product, 4)):
+        raise RuntimeError("GPU matrix multiplication returned an unexpected device or result.")
+    product.sum().backward()
+    if not torch.allclose(values.grad, torch.full_like(values, 8)):
+        raise RuntimeError("GPU matrix gradients are incorrect.")
+    pixels = torch.ones((1, 1, 8, 8), device=device, requires_grad=True)
+    weights = torch.ones((1, 1, 3, 3), device=device, requires_grad=True)
+    convolution = torch.nn.functional.conv2d(pixels, weights)
+    if convolution.device.type != device or not torch.allclose(convolution, torch.full_like(convolution, 9)):
+        raise RuntimeError("GPU convolution failed.")
+    convolution.sum().backward()
+    if not torch.isfinite(pixels.grad).all().item() or not torch.isfinite(weights.grad).all().item():
+        raise RuntimeError("GPU convolution gradients are not finite.")
+    if device == "cuda":
+        torch.cuda.synchronize()
+    else:
+        torch.mps.synchronize()
+
+
+def check_gpu(device):
+    if device not in ("cuda", "mps"):
+        raise ValueError("GPU checks require cuda or mps.")
+    check = {"name": "PyTorch GPU computation", "version": "", "ok": False, "error": ""}
+    hardware = ""
+    try:
+        import torch
+        import torchvision
+
+        check["version"] = f"torch {torch.__version__}; torchvision {torchvision.__version__}"
+        if device == "cuda":
+            if not torch.cuda.is_available():
+                raise RuntimeError("CUDA is unavailable. Check the NVIDIA driver, installed PyTorch build, and CUDA_VISIBLE_DEVICES.")
+            index = torch.cuda.current_device()
+            properties = torch.cuda.get_device_properties(index)
+            hardware = f"{properties.name}; {properties.total_memory / 1024 ** 3:.1f} GiB; CUDA {torch.version.cuda}"
+        else:
+            if not torch.backends.mps.is_available():
+                raise RuntimeError("Apple MPS is unavailable. Use a native Apple Silicon Python and a supported macOS version.")
+            hardware = "Apple MPS"
+        _torch_gpu_operations(torch, device)
+        check["ok"] = True
+        emit(f"GPU computation and gradients passed: {hardware}")
+    except Exception as exc:
+        check["error"] = str(exc)
+        emit(f"GPU check failed: {exc}")
+    return {
+        "ready": check["ok"], "checks": [check], "device": device,
+        "hardware": hardware, "refinement": engine_profile().get("refinement", "not tested"),
+    }
 
 
 def validate_output(path, inputs):
@@ -164,11 +237,23 @@ def run_job(operation, payload):
         raise RuntimeError("The SAMStars engine requires Python 3.10–3.12.")
     if operation == "check":
         return check_dependencies()
-    if operation not in ("train", "segment"):
+    if operation == "check_gpu":
+        return check_gpu(payload.get("device"))
+    step_operations = {"alignrasters", "costsurface", "generateseeds", "proposals", "refine"}
+    if operation not in {"train", "segment", *step_operations}:
         raise ValueError(f"Unknown operation: {operation}")
     version = importlib.metadata.version("samstars")
     if version != SAMSTARS_VERSION:
         raise RuntimeError(f"This plugin requires samstars=={SAMSTARS_VERSION}; found {version}.")
+    if operation in step_operations:
+        if __package__:
+            steps = importlib.import_module(".steps", __package__)
+        else:
+            # -I intentionally omits the script directory from sys.path.
+            spec = importlib.util.spec_from_file_location("samstars_workflow_steps", Path(__file__).with_name("steps.py"))
+            steps = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(steps)
+        return steps.run_step(operation, payload, emit=emit, validate_output=validate_output, claim_output=claim_output)
     import samstars
 
     arguments = dict(payload)
@@ -196,7 +281,9 @@ def run_job(operation, payload):
         raise ValueError("CUDA is unavailable in this engine. Select CPU or configure a CUDA environment in setup.")
     if device == "mps" and not torch.backends.mps.is_available():
         raise ValueError("MPS is unavailable in this engine. Select CPU or use Apple Silicon with an MPS-enabled PyTorch.")
-    arguments["stardist_cpu"] = device == "cpu"
+    arguments["stardist_cpu"] = device == "cpu" or engine_profile().get("refinement") == "cpu"
+    if device != "cpu" and arguments["stardist_cpu"]:
+        emit("SAM proposals use the selected GPU; StarDist refinement uses CPU in this private engine.")
     emit("Running SAMStars. Stage logs follow; large scenes can take a long time.", 5)
     with claim_output(arguments["out"]):
         if operation == "train":

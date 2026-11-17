@@ -1,4 +1,4 @@
-"""Shared parameters and input validation for the two scene workflows."""
+"""Shared Processing parameters, input validation, and worker execution."""
 
 from pathlib import Path
 
@@ -44,7 +44,7 @@ class SamStarsAlgorithm(QgsProcessingAlgorithm):
                 type=QgsProcessingParameterNumber.Type.Integer, defaultValue=0, minValue=0,
             ))
         self.add_advanced(QgsProcessingParameterEnum(
-            "DEVICE", "Compute device", options=["CPU", "CUDA", "Apple MPS"], defaultValue=0,
+            "DEVICE", "SAM compute device (private engines refine on CPU)", options=["CPU", "CUDA", "Apple MPS"], defaultValue=0,
         ))
         self.add_advanced(QgsProcessingParameterBoolean(
             "KEEP_INTERMEDIATES", "Keep intermediate files", defaultValue=False,

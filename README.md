@@ -4,8 +4,8 @@ Train models and segment individual tree crowns in the **QGIS Processing
 Toolbox**. The plugin follows the PyForestScan QGIS plugin: ordinary Processing
 dialogs, batch/model support, and one small setup dialog.
 
-Requires **QGIS 4.0 or later**. Version **0.1.0 is experimental** and targets the
-SAMStars **0.2.0** public API. Scientific libraries run in a separate Python
+Requires **QGIS 4.0 or later**. Version **0.1.3 is experimental**.
+Scientific libraries run in a separate Python
 3.10–3.12 environment.
 
 ## Install
@@ -14,9 +14,11 @@ SAMStars **0.2.0** public API. Scientific libraries run in a separate Python
    `dist/samstars_qgis.zip`.
 2. In QGIS, open **Plugins → Manage and Install Plugins → Install from ZIP**,
    select that ZIP, and enable **SAMStars**.
-3. Open **Plugins → SAMStars → Set up SAMStars**. Select a Python 3.10–3.12
-   executable, then click **Install private engine**. Alternatively, select
-   an environment that already contains `samstars==0.2.0` and click **Use existing**.
+3. Open **Plugins → SAMStars → Set up SAMStars** and click **Install engine**.
+   Setup detects an installed Python 3.10–3.12. Open **Advanced** to choose a
+   Python executable yourself or select a prepared SAMStars environment with
+   **Use existing environment**. Setup shows status and progress in the main
+   dialog, with detailed logs under Advanced.
 4. Run **Check SAMStars dependencies** in the Processing Toolbox. Its log and
    HTML report show import checks, small CPU operations, CRS transformation,
    and a GeoPackage round trip.
@@ -24,10 +26,13 @@ SAMStars **0.2.0** public API. Scientific libraries run in a separate Python
 The private installer needs an existing Python with `venv`/`ensurepip`, internet
 access, and several GB of disk space. It creates a new environment under the
 active QGIS profile's `samstars/engines` directory, installs SAMStars and its
-dependencies, and selects it only after validation. Linux installs CPU builds
+dependencies, and selects it only after validation. Linux defaults to CPU builds
 of PyTorch/Torchvision. QGIS's Python and the selected base environment are not
 modified. Failed or canceled installs remove only the new environment; older
-engines remain available. Successful reinstallations retain older engines.
+engines remain available. **Repair engine** builds and validates a replacement
+before selecting it. **Remove engine** removes only private environments marked
+as belonging to this plugin; external environments and older unmarked installs
+are preserved. A failed or canceled operation keeps its error visible in setup.
 The base Python installation must remain available for its virtual environments.
 
 Automatic installation targets **Linux x64** and **Apple Silicon macOS**,
@@ -35,12 +40,65 @@ following SAMStars's supported platforms (Ubuntu 20.04+ and macOS 14+).
 Windows, Intel macOS, and Linux ARM are not tested SAMStars release targets;
 they can select an existing environment, but this plugin does not promise
 working scientific packages on those platforms. No portable Python, models,
-checkpoints, or GPU runtimes are bundled. The installer pins SAMStars itself;
+checkpoints, or GPU runtimes are bundled. CPU setup pins SAMStars itself;
 transitive dependencies resolve within its published constraints.
+
+## Optional GPU setup
+
+Open **Set up SAMStars → GPU setup…** to install a GPU engine or **Test selected
+engine** without changing it. GPU setup accelerates **SAM proposals and SAM
+training (PyTorch)**. **StarDist refinement (TensorFlow) stays on CPU in private
+engines**, including when CUDA or Apple MPS is selected. This distinction also
+appears in the dialog and job log; it is not full-pipeline GPU acceleration.
+
+| Computer | Automatic GPU setup |
+| --- | --- |
+| Linux x64, NVIDIA | CUDA PyTorch and its runtime dependencies, after a driver check |
+| Apple Silicon, macOS 14+ | Native arm64 PyTorch with MPS; no separate GPU driver installation |
+| Native Windows, Intel macOS, Linux ARM | Not offered; an existing environment can be selected and tested |
+| AMD/Intel GPUs on Linux | Not offered; use CPU or a prepared environment |
+
+For NVIDIA, setup queries `nvidia-smi`, uses CUDA 12.6 for older cards and 12.8
+when a Blackwell-or-newer card is detected, and requires driver **560.35.05+** or
+**570.124.06+**, respectively. These are deliberately conservative installer
+requirements, not a claim about the minimum driver every CUDA application can
+use. See the [NVIDIA driver tables](https://docs.nvidia.com/cuda/archive/12.9.2/cuda-toolkit-release-notes/index.html)
+and [PyTorch build pairs](https://pytorch.org/get-started/previous-versions/).
+The final GPU computation must still pass: detecting a card cannot prove
+that a wheel supports its kernels. Mixed GPU configurations and visibility
+overrides are checked on the default GPU visible to the worker. Setup respects
+`CUDA_VISIBLE_DEVICES`. It does not install drivers, change OS packages, enable
+WSL, or compile a CUDA toolkit. WSL deployment is not a tested release target.
+
+GPU profiles pin the PyTorch/Torchvision pair, TensorFlow, and NumPy; other
+dependencies resolve within SAMStars's constraints. Installation requires binary
+wheels, runs `pip check`, validates CPU/geospatial operations, then runs GPU
+matrix/convolution operations and gradients in a separate process. Only a
+successful installation becomes the selected engine. Failure or cancellation
+removes the new environment and keeps the previous selection. **Repair engine**
+preserves the selected private GPU profile. To return to CPU, choose **CPU
+(default) → Install CPU engine** in GPU setup, or select a previous environment
+under Advanced. Retained environments use additional disk space.
+
+Select **CUDA** or **Apple MPS** in a Processing tool's Advanced parameters after
+setup; CPU remains the default. Selecting a device never installs packages.
+The GPU test checks small kernels, not full model compatibility or available
+memory for a scene. Start with a small scene. GPU setup remains experimental
+until complete training/inference runs pass on each supported release target.
+
+TensorFlow's CUDA extras pin different NVIDIA libraries from the PyTorch
+profiles, so setup does not combine them or bypass the dependency resolver.
+It also does not install `tensorflow-metal`. Full TensorFlow GPU support needs
+a separately validated dependency strategy; installing every optional GPU
+package into the same environment is not supported by this installer.
 
 For a custom CPU/GPU environment, follow the
 [SAMStars installation guide](https://samstars.sefa.ai/installation/), then select
-that environment's Python in setup. For development with the neighboring source:
+that environment's Python under **Advanced → Use existing environment**.
+The [TensorFlow GPU guide](https://www.tensorflow.org/install/pip) and
+[Apple Metal guide](https://developer.apple.com/metal/tensorflow-plugin/) describe
+the optional runtime packages; keep their versions within SAMStars's dependency
+constraints. For development with the neighboring source:
 
 ```bash
 # Run inside a separate Python 3.10–3.12 environment.
@@ -59,9 +117,19 @@ as a QGIS plugin. Restart QGIS after updating the plugin.
 | --- | --- | --- |
 | Segment tree crowns | `samstars:segment` | Crown GeoPackage, automatically loaded into the project |
 | Train a model | `samstars:train` | Reusable model bundle folder |
+| Align input rasters | `samstars:alignrasters` | CHM and density aligned to the original imagery |
+| Build cost surface | `samstars:costsurface` | Boundary-cost raster |
+| Generate seed points | `samstars:generateseeds` | Editable seed GeoPackage |
+| Generate crown proposals (SAM) | `samstars:proposals` | Proposal records, probability, and canopy-index rasters |
+| Refine crowns (StarDist) | `samstars:refine` | Crown GeoPackage from saved proposals |
 | Check SAMStars dependencies | `samstars:checkdependencies` | HTML report and `READY` boolean |
 
-Both workflows take **imagery**, a **canopy height model in metres**, and a
+**Tree crowns** contains the full segmentation and training workflows.
+**Workflow steps** contains the five independent steps. **Setup** contains
+the dependency check. Segment tree crowns still handles alignment, cost
+construction, seed generation, SAM proposals, and refinement automatically.
+
+The full workflows take **imagery**, a **canopy height model in metres**, and a
 **first-return density raster**. Use local GDAL-readable rasters. Imagery must
 have a projected CRS in metres and north-up square pixels. CHM and density
 must each have one band, a defined CRS, and overlapping coverage. SAMStars
@@ -88,20 +156,67 @@ device, intermediate storage, and training epoch counts. RGB uses one-based
 indices in red, green, blue order (training default: `1,2,3`). For segmentation,
 blank RGB and zero NIR/texture reuse the bundle settings; zero does not disable
 a band already stored in the model. CPU is the default. The device setting
-selects PyTorch proposals, and CPU mode hides CUDA from refinement.
-TensorFlow manages refinement acceleration independently; a custom TensorFlow
-Metal installation can still select its own devices.
+selects PyTorch proposals. Private engines explicitly run refinement with CUDA
+hidden, including in GPU profiles. In custom environments, TensorFlow manages
+refinement acceleration independently; a custom TensorFlow Metal installation
+can still select its own devices.
+
+### Run individual workflow steps
+
+Use **SAMStars → Workflow steps** to inspect results and adjust settings between
+stages. Each tool opens its own Processing dialog and saves its outputs. Choose
+a permanent, new or empty folder for each run. The first three steps need no
+model bundle; proposal generation and refinement use a trained bundle.
+
+1. **Align input rasters:** choose the original imagery, CHM, and density.
+   The tool writes `chm.tif` and `den.tif` using bilinear resampling. Use those
+   aligned rasters downstream. `REFERENCE_IMAGE` points to the original imagery,
+   preserving all its bands. Skip this step if the grids already match exactly.
+2. **Build cost surface:** use the original imagery and aligned CHM. Set relative
+   height-edge, NDVI-gap, and texture weights. Select RGB, NIR, and texture bands
+   under Advanced to match training; NDVI is omitted without a NIR band.
+   The result is `cost.tif`, with valid values from 0 to 1.
+3. **Generate seed points:** use aligned CHM/density and the cost surface. Controls
+   include the peak threshold (applied to both CHM and density), minimum canopy
+   height, search radius, smoothing, and merge radius. Advanced exposes cost
+   penalties, height splitting, and final thinning. Inspect `seeds.gpkg` in QGIS
+   and move, add, or delete points as needed.
+4. **Generate crown proposals (SAM):** select the original imagery, aligned CHM,
+   cost surface, edited seed layer, and trained model bundle. Selected features,
+   layer filters, and unsaved edits are exported; seeds and costs are not
+   regenerated. RGB defaults come from the bundle. Advanced offers CUDA/MPS,
+   prompt batching, and smoothing controls. Probability and canopy-index rasters
+   are loaded for inspection. Pass the **Proposal records** output
+   (`proposals/proposal_records.json`) to the next step.
+5. **Refine crowns (StarDist):** select those proposal records and the same model
+   bundle. Leave thresholds at `-1` to use model settings, or override both
+   together. Advanced offers window size/overlap, minimum crown area, edge
+   exclusion, and duplicate suppression. This tool always uses CPU and reuses
+   the saved proposals without rerunning SAM. It repairs invalid raster-derived
+   outlines while preserving crown attributes, then loads `crowns/crowns.gpkg`.
+
+The dialogs reject grid mismatches instead of silently resampling later inputs.
+Proposals ignore seeds outside the image extent and report how many were skipped;
+seeds on missing CHM/cost data must be corrected. Keep proposal folders and their
+rasters in place: the records refer to those files. Step outputs and prepared
+inputs are retained, and `workflow.json` records the requested settings and
+outputs. Temporary Processing destinations still expire with the session.
+Use new output folders to compare seed or refinement settings.
+
+These tools operate on existing imagery/CHM/density rasters. They do not generate
+CHM or density from raw point clouds. Model training remains the separate
+**Train a model** workflow.
 
 Choose **new or empty output folders**. The plugin rejects reuse and output
 paths that contain inputs or lie inside the model bundle. Intermediate files
-are temporary unless **Keep intermediate files** is enabled. A canceled job
+in the full segmentation/training tools are temporary unless **Keep intermediate
+files** is enabled; Workflow steps retain theirs. A canceled job
 can leave partial outputs; choose a new folder for the next run. Temporary
 Processing destinations last only for the session; choose a permanent folder
 to retain a trained model or segmentation result.
 
 Start with a small scene. Training and segmentation can require substantial
-time, RAM, and disk space. The minimal plugin exposes the two single-scene
-workflows; prepared tiles, resume controls, and individual pipeline stages
+time, RAM, and disk space. Prepared-tile batch workflows and resume controls
 remain in the SAMStars Python API. Cancellation stops the worker and its child
 processes on the supported Linux/macOS platforms. Progress reports stage logs,
 not an estimate of remaining time.
@@ -110,17 +225,21 @@ not an estimate of remaining time.
 
 ```bash
 python3 -m unittest discover -s tests -p 'test_runtime.py' -v
+python3 -m unittest discover -s tests -p 'test_steps.py' -v
 QT_QPA_PLATFORM=offscreen /usr/bin/python3 -m unittest discover -s tests -p 'test_qgis.py' -v
 python3 scripts/package_plugin.py
 ```
 
-Use a QGIS-enabled Python for the second command. The tests also run against
-QGIS 3.44's shared Processing APIs as a development check; the plugin's startup
-guard still rejects QGIS 3.x. **QGIS 4/Qt6 runtime testing and a full model
-training/inference run are required before a stable release.** Protocol,
-cancellation, path protection, parameter mapping, real Processing registration,
-and polygon export are covered separately. See [tests/README.md](tests/README.md)
-for the optional real-engine and raster checks.
+Use a QGIS-enabled Python for the second command. The current integration tests
+pass on **QGIS 4.2.3 / Qt 6.11.2**. They cover the setup dialog, background work
+and cancellation, menu lifecycle, Processing parameters, registration, and
+polygon/seed export, and independent step dialogs. Scientific step tests also
+run in a SAMStars environment. The plugin's startup guard rejects QGIS 3.x. A fresh private
+CUDA 12.8 engine passed installation, CPU/geospatial checks, and real GPU
+operations on an RTX 5090. **Full model training/inference and installation on
+the other release targets still need testing before a stable release.**
+See [tests/README.md](tests/README.md) for commands,
+runtime verification details, and the optional real-engine and raster checks.
 
 QGIS 4 metadata and Qt imports follow the
 [official QGIS migration guide](https://github.com/qgis/QGIS/wiki/Plugin-migration-to-be-compatible-with-Qt5-and-Qt6).

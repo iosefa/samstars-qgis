@@ -8,6 +8,7 @@ from qgis.core import QgsProcessingProvider
 from .algorithms.dependency_check import DependencyCheckAlgorithm
 from .algorithms.segment import SegmentAlgorithm
 from .algorithms.train import TrainAlgorithm
+from .algorithms.steps import AlignRastersAlgorithm, CostSurfaceAlgorithm, SeedsAlgorithm, ProposalsAlgorithm, RefineAlgorithm
 
 
 class SamStarsProvider(QgsProcessingProvider):
@@ -27,3 +28,5 @@ class SamStarsProvider(QgsProcessingProvider):
         self.addAlgorithm(SegmentAlgorithm())
         self.addAlgorithm(TrainAlgorithm())
         self.addAlgorithm(DependencyCheckAlgorithm())
+        for algorithm in (AlignRastersAlgorithm, CostSurfaceAlgorithm, SeedsAlgorithm, ProposalsAlgorithm, RefineAlgorithm):
+            self.addAlgorithm(algorithm())

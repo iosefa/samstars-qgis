@@ -15,28 +15,64 @@
   <h1>SAMStars for QGIS</h1>
   <p>Individual tree crowns from imagery and lidar rasters. Requires QGIS 4.0 or
     later. This experimental plugin uses the Processing Toolbox for analysis.</p>
-  <nav><a href="#setup">Setup</a> · <a href="#segment">Segment</a> ·
-    <a href="#train">Train</a> · <a href="#checkdependencies">Check dependencies</a></nav>
+  <nav><a href="#setup">Setup</a> · <a href="#gpu">GPU setup</a> · <a href="#segment">Segment</a> ·
+    <a href="#train">Train</a> · <a href="#steps">Workflow steps</a> · <a href="#checkdependencies">Check dependencies</a></nav>
 
   <h2 id="setup">Set up the engine</h2>
   <ol>
     <li>Open <strong>Plugins → SAMStars → Set up SAMStars</strong>.</li>
-    <li>Select a Python 3.10–3.12 executable and click <strong>Install private engine</strong>.
-      Python must have <code>venv</code> and <code>ensurepip</code> available.</li>
-    <li>Alternatively, select an environment with <code>samstars==0.2.0</code> and
-      click <strong>Use existing</strong>. The environment is checked before selection.</li>
+    <li>Click <strong>Install engine</strong>. Setup detects an installed Python
+      3.10–3.12 with <code>venv</code> and <code>ensurepip</code> support.</li>
+    <li>Open <strong>Advanced</strong> to select Python manually or choose a
+      prepared SAMStars environment and click <strong>Use existing environment</strong>.
+      The environment is checked before selection. Detailed logs are also under Advanced.</li>
   </ol>
   <p>Installation requires internet access and several GB of free space. The
     installer creates a private environment in the active profile under
     <code>samstars/engines</code>. QGIS and your base Python are unchanged. Failed
-    installs leave the previous engine selected; successful repairs keep older
-    engines. Keep the base Python installed.</p>
+    installs leave the previous engine selected. <strong>Repair engine</strong>
+    validates a replacement before selecting it. <strong>Remove engine</strong>
+    deletes only private environments marked as belonging to this plugin;
+    external environments and older unmarked installs are kept. Keep the base
+    Python installed.</p>
   <p>Automatic installation supports Linux x64 (Ubuntu 20.04+) and Apple Silicon
     macOS 14+, following the SAMStars supported platforms. Other platforms need
-    an existing environment and are untested. Linux uses CPU-only PyTorch.
-    For CUDA or MPS, configure a compatible environment using the
+    an existing environment and are untested. Installation defaults to CPU.
+    For a custom environment, follow the
     <a href="https://samstars.sefa.ai/installation/">SAMStars installation guide</a>.
+    Select it under <strong>Advanced → Use existing environment</strong>.
     The environment variable <code>SAMSTARS_PYTHON</code> overrides the saved Python path.</p>
+
+  <h2 id="gpu">Optional GPU setup</h2>
+  <p>Open <strong>Set up SAMStars → GPU setup…</strong>. Choose NVIDIA CUDA on
+    Linux x64 or Apple MPS on native Apple Silicon macOS 14+. Click
+    <strong>Install GPU engine</strong> to build a private environment, or
+    <strong>Test selected engine</strong> to run a GPU check without installing
+    anything. GPU setup is experimental.</p>
+  <p><strong>GPU acceleration applies to SAM proposals and SAM training.
+    StarDist refinement stays on CPU in private engines.</strong> PyTorch and
+    TensorFlow CUDA packages have conflicting runtime pins, so this installer
+    does not combine them. TensorFlow Metal is not installed either.</p>
+  <p>NVIDIA setup checks <code>nvidia-smi</code> before downloading. Its CUDA 12.6
+    profile requires driver 560.35.05+; detected Blackwell-or-newer cards use
+    CUDA 12.8 and require driver 570.124.06+. Update drivers through your operating
+    system if needed. These conservative requirements do not guarantee every
+    GPU architecture works. The final computation test must pass. Setup respects
+    <code>CUDA_VISIBLE_DEVICES</code> and tests the worker's default visible GPU.</p>
+  <p>The plugin downloads runtime packages into a new environment. It never
+    installs system drivers, changes QGIS packages, enables WSL, or compiles CUDA.
+    Native Windows, Intel macOS, Linux ARM, and AMD/Intel GPUs on Linux do not have
+    an automatic GPU profile. Prepared environments can be selected and tested.
+    WSL is not a tested release target.</p>
+  <p>Setup checks package consistency, CPU and geospatial operations, and GPU
+    matrix/convolution operations with gradients before selecting the new
+    engine. Failed or canceled setup keeps the previous selection. Repair
+    preserves the GPU profile. To switch back, choose <strong>CPU (default) →
+    Install CPU engine</strong>, or select a previous environment under Advanced.</p>
+  <p>After successful setup, choose <strong>CUDA</strong> or <strong>Apple MPS</strong>
+    in your Processing tool's Advanced parameters. CPU remains the default.
+    Selecting a device never installs packages. Start with a small scene: a
+    successful GPU check does not validate a complete model or its memory needs.</p>
 
   <h2>Prepare the scene</h2>
   <p>Choose local GDAL-readable imagery, a single-band canopy height model in
@@ -48,7 +84,7 @@
     pixel values first. Export web services and subdatasets as GeoTIFFs.</p>
 
   <h2 id="segment">Segment tree crowns</h2>
-  <p>In the Processing Toolbox, run <strong>SAMStars → Segment tree crowns</strong>.
+  <p>In the Processing Toolbox, run <strong>SAMStars → Tree crowns → Segment tree crowns</strong>.
     Select the three scene rasters and a trained model bundle directory containing
     <code>manifest.json</code>. Choose a new or empty output folder.</p>
   <p>The final <code>crowns/crowns.gpkg</code> is loaded into the project and
@@ -56,9 +92,12 @@
     parameters allow overrides: RGB is a comma-separated list in red, green,
     blue order, with one-based indices. Blank RGB and zero NIR/texture reuse
     model settings; zero cannot disable a band stored in the model.</p>
+  <p>This tool performs alignment, cost construction, seed generation, SAM
+    proposals, and StarDist refinement automatically. Use Workflow steps below
+    to adjust or inspect individual stages.</p>
 
   <h2 id="train">Train a model</h2>
-  <p>Run <strong>SAMStars → Train a model</strong>. Select the three scene rasters,
+  <p>Run <strong>SAMStars → Tree crowns → Train a model</strong>. Select the three scene rasters,
     labeled crown polygons, and the SAM ViT-L checkpoint
     <code>sam_vit_l_0b3195.pth</code> from the
     <a href="https://github.com/facebookresearch/segment-anything#model-checkpoints">official SAM checkpoint list</a>.
@@ -70,18 +109,75 @@
     epoch counts. The new model folder is returned as <code>MODEL</code> and
     <code>OUTPUT</code>; supply it to segmentation.</p>
 
+  <h2 id="steps">Workflow steps</h2>
+  <p>Open <strong>SAMStars → Workflow steps</strong> in the Processing Toolbox.
+    Each tool has its own dialog and saves outputs for inspection and reuse.
+    Choose a permanent, new or empty folder for each run. The first three steps
+    need no model; proposals and refinement use a trained bundle. These tools
+    use existing rasters and do not derive CHM/density from raw point clouds.</p>
+
+  <h3 id="alignrasters">1. Align input rasters</h3>
+  <p>Choose imagery, canopy height, and first-return density. The imagery defines
+    the grid; it must use a projected CRS in metres and north-up square pixels.
+    Bilinear resampling writes <code>chm.tif</code> and <code>den.tif</code> to that
+    grid and loads them. <code>REFERENCE_IMAGE</code> points to the original
+    imagery, retaining all its bands. Use the aligned CHM/density downstream.
+    Skip alignment if all grids already match. This does not fix survey offsets.</p>
+
+  <h3 id="costsurface">2. Build cost surface</h3>
+  <p>Select the original imagery and aligned CHM. Set the relative height-edge,
+    NDVI-gap, and texture weights; available terms are normalized. Under Advanced,
+    choose RGB, NIR, and texture bands to match training. Without NIR, NDVI is
+    omitted. <code>cost.tif</code> is loaded with values from 0 to 1; higher values
+    indicate stronger boundary cues. Later steps require exactly matching grids.</p>
+
+  <h3 id="generateseeds">3. Generate seed points</h3>
+  <p>Select aligned CHM, density, and cost. Adjust the minimum peak value,
+    minimum canopy height, peak-search radius, Gaussian smoothing, and candidate
+    merge radius. The peak threshold applies to both CHM and density, so density
+    units matter. Advanced includes cost penalty, height splitting, and final
+    thinning. The result is an editable <code>seeds.gpkg</code>.</p>
+  <p>Inspect the seeds over the imagery. Move, add, or delete points using QGIS
+    editing tools before proceeding. You can also select a subset for proposals.</p>
+
+  <h3 id="proposals">4. Generate crown proposals (SAM)</h3>
+  <p>Select the original imagery, aligned CHM, cost, edited seeds, and model
+    bundle. Selections, filters, and unsaved seed edits are exported. Seeds and
+    costs are used as supplied. RGB bands default to the model settings;
+    Advanced exposes device, prompt batching, and smoothing. CPU is the default;
+    choose CUDA or MPS after GPU setup. Points outside the image are skipped
+    with a log message. Points on missing CHM/cost data must be corrected.</p>
+  <p>Probability and canopy-index rasters are loaded for inspection. These are
+    proposal rasters; the next step produces polygons. Pass the
+    <strong>Proposal records</strong> output
+    (<code>proposals/proposal_records.json</code>) to refinement. Keep this folder
+    and its rasters in place, because the records contain their paths.</p>
+
+  <h3 id="refine">5. Refine crowns (StarDist)</h3>
+  <p>Select the saved proposal records and the same model bundle. Leave both
+    thresholds at <code>-1</code> for the model settings, or set both explicitly.
+    Advanced controls window size/overlap, minimum crown area, edge exclusion,
+    and duplicate suppression. Set window size and overlap to <code>0</code> to
+    refine whole rasters. This tool always uses CPU and does not rerun SAM.</p>
+  <p>Invalid outlines from raster boundaries are repaired while preserving each
+    crown's attributes. The result <code>crowns/crowns.gpkg</code> is loaded into QGIS. To compare
+    refinement settings, reuse the same proposals with a new output folder.</p>
+
   <h2>Storage and compute</h2>
-  <p>CPU is the default. The device setting controls PyTorch proposals, and CPU
-    mode hides CUDA from refinement. TensorFlow manages refinement acceleration
-    independently; custom TensorFlow Metal environments can select their own
-    devices. Start with a small
+  <p>CPU is the default. The device setting controls PyTorch proposals. Private
+    engines run StarDist refinement on CPU, including when GPU proposals are
+    selected. In custom environments, TensorFlow manages refinement acceleration
+    independently in the full workflows; the separate Refine crowns tool
+    explicitly uses CPU in every environment. Start with a small
     area: large scenes and training can need substantial memory and time.</p>
-  <p>Outputs must be new or empty folders. Intermediate files are removed unless
-    <strong>Keep intermediate files</strong> is checked. Choose a permanent
+  <p>Outputs must be new or empty folders. Full segmentation/training removes
+    intermediate files unless <strong>Keep intermediate files</strong> is checked.
+    Workflow steps retain their outputs and prepared inputs, with requested
+    settings and output paths in <code>workflow.json</code>. Choose a permanent
     output folder to retain results beyond the session. Cancel stops the worker
     and its child processes on Linux/macOS; partial output or temporary files
-    can remain. Use a fresh folder for another run. Prepared tiles, resuming,
-    and individual stages are available through the SAMStars Python API.</p>
+    can remain. Use a fresh folder for another run. Prepared-tile batch workflows
+    and resuming are available through the SAMStars Python API.</p>
 
   <h2 id="checkdependencies">Check dependencies</h2>
   <p>Run <strong>Check SAMStars dependencies</strong> for an HTML report and

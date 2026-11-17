@@ -1,8 +1,9 @@
 [general]
 name=SAMStars
-description=Individual tree crown segmentation and model training in the Processing Toolbox.
-about=Train and apply SAMStars models using imagery, canopy heights, and first-return density. Includes a small setup dialog for an isolated Python engine. Requires QGIS 4.0 or later, Python 3.10–3.12 for the engine, and a trained model bundle or SAM ViT-L checkpoint. CPU is the default. See bundled help for installation and platform support.
-version=0.1.0
+description=Tree crown segmentation, model training, and individual workflow steps in the Processing Toolbox.
+about=Train and apply SAMStars models using imagery, canopy heights, and first-return density. Run the whole segmentation workflow or align rasters, build costs, edit seeds, generate proposals, and refine crowns separately. Includes setup for an isolated Python engine. Requires QGIS 4.0 or later and Python 3.10–3.12 for the engine. Neural steps require a trained model bundle; training requires a SAM ViT-L checkpoint. CPU is the default. See bundled help for installation and platform support.
+version=0.1.3
+changelog=0.1.3: Add Workflow steps dialogs for raster alignment, cost surfaces, editable seed points, SAM proposals, and independent StarDist refinement.
 qgisMinimumVersion=4.0
 author=Iosefa Percival
 email=ipercival@gmail.com
