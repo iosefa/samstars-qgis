@@ -12,6 +12,7 @@ from qgis.core import (
 )
 
 from .common import SamStarsAlgorithm
+from ..runtime.steps import SHARED_OUTPUT_FILES
 
 
 class WorkflowStep(SamStarsAlgorithm):
@@ -21,8 +22,8 @@ class WorkflowStep(SamStarsAlgorithm):
     def groupId(self):
         return "steps"
 
-    def raster(self, name, label):
-        self.addParameter(QgsProcessingParameterRasterLayer(name, label))
+    def raster(self, name, label, *, optional=False):
+        self.addParameter(QgsProcessingParameterRasterLayer(name, label, optional=optional))
 
     def number(self, name, label, default, *, minimum=0, maximum=None, integer=False, advanced=False):
         kwargs = {"defaultValue": default, "minValue": minimum}
@@ -48,17 +49,22 @@ class WorkflowStep(SamStarsAlgorithm):
             "MODEL", "SAMStars model bundle folder", behavior=QgsProcessingParameterFile.Behavior.Folder,
         ))
 
-    def raster_path(self, parameters, name, context, *, image=False):
+    def raster_path(self, parameters, name, context, *, image=False, reference=False, allow_reprojection=False):
         layer = self.parameterAsRasterLayer(parameters, name, context)
         if layer is None or not layer.isValid():
             raise QgsProcessingException(f"Choose a valid {name.lower()} raster.")
         path = Path(layer.source()).expanduser()
         if layer.providerType() != "gdal" or not path.is_file():
             raise QgsProcessingException(f"{name}: export the raster to a local GeoTIFF first.")
-        if not layer.crs().isValid() or (not image and layer.bandCount() != 1):
-            raise QgsProcessingException(f"{name} needs a defined CRS" + ("." if image else " and one band."))
-        if image and (layer.bandCount() < 3 or layer.crs().isGeographic() or layer.crs().mapUnits() != Qgis.DistanceUnit.Meters):
-            raise QgsProcessingException("Imagery needs at least three bands and a projected CRS in metres.")
+        single = not (image or reference)
+        if not layer.crs().isValid() or (single and layer.bandCount() != 1):
+            raise QgsProcessingException(f"{name} needs a defined CRS" + (" and one band." if single else "."))
+        if image and layer.bandCount() < 3:
+            raise QgsProcessingException("Imagery needs at least three bands.")
+        if (reference or (image and not allow_reprojection)) and (
+            layer.crs().isGeographic() or layer.crs().mapUnits() != Qgis.DistanceUnit.Meters
+        ):
+            raise QgsProcessingException(f"{name} needs a projected CRS in metres.")
         return str(path.resolve())
 
     def band_payload(self, parameters, context, *, model=False):
@@ -84,7 +90,7 @@ class WorkflowStep(SamStarsAlgorithm):
         return str(path)
 
     def execute(self, payload, parameters, context, feedback, *, inputs, layers=()):
-        payload["out"] = self.output_path(parameters, context, inputs)
+        payload["out"] = self.output_path(parameters, context, inputs, filenames=SHARED_OUTPUT_FILES.get(self.name()))
         result = self.run_engine(self.name(), payload, feedback)
         if context.project() is not None and not feedback.isCanceled():
             for key, label, vector in layers:
@@ -104,26 +110,42 @@ class AlignRastersAlgorithm(WorkflowStep):
 
     def shortHelpString(self):
         return (
-            "Align CHM and first-return density to the imagery's CRS, extent, resolution, and pixel grid. "
-            "Imagery must already be north-up with square pixels in a projected CRS in metres. "
-            "Bilinear resampling matches SAMStars preparation. Density units must stay consistent with training. "
-            "The original imagery is returned as a reference; its bands are preserved. This does not create "
-            "CHM/density from point clouds or correct survey misregistration. Choose a new or empty output folder."
+            "Choose a reference raster to define the output CRS, extent, resolution, and pixel grid. "
+            "It must be north-up with square pixels in a projected CRS in metres. Select at least one of "
+            "imagery, CHM, first-return density, or intensity to align; all four inputs are optional. "
+            "Use your CHM as the reference to bring the other rasters onto its grid. All imagery bands "
+            "are preserved. Bilinear resampling is used when grids differ; already matching inputs are "
+            "copied without interpolation. Density units must stay consistent with training. "
+            "The reference file is not modified. This matches pixel grids, not survey misregistration. "
+            "Choose a new or empty output folder."
         )
 
     def initAlgorithm(self, config=None):
-        for name, label in (("IMAGE", "Reference imagery"), ("CHM", "Canopy height (metres)"), ("DENSITY", "First-return density")):
-            self.raster(name, label)
+        self.raster("REFERENCE", "Reference raster (defines the output grid)")
+        for name, label in (("IMAGE", "Imagery"), ("CHM", "Canopy height (metres)"),
+                            ("DENSITY", "First-return density"), ("INTENSITY", "LiDAR intensity")):
+            self.raster(name, label, optional=True)
         self.add_output_folder("Aligned raster folder")
-        for key, label in (("REFERENCE_IMAGE", "Reference imagery"), ("ALIGNED_CHM", "Aligned canopy height"), ("ALIGNED_DENSITY", "Aligned first-return density")):
+        for key, label in (("REFERENCE_RASTER", "Reference raster"), ("ALIGNED_IMAGE", "Aligned imagery"),
+                           ("ALIGNED_CHM", "Aligned canopy height"), ("ALIGNED_DENSITY", "Aligned first-return density"),
+                           ("ALIGNED_INTENSITY", "Aligned intensity")):
             self.addOutput(QgsProcessingOutputRasterLayer(key, label))
 
     def processAlgorithm(self, parameters, context, feedback):
-        payload = {key: self.raster_path(parameters, name, context, image=name == "IMAGE") for name, key in
-                   (("IMAGE", "img"), ("CHM", "chm"), ("DENSITY", "den"))}
-        return self.execute(payload, parameters, context, feedback, inputs=list(payload.values()), layers=(
-            ("ALIGNED_CHM", "Aligned canopy height", False), ("ALIGNED_DENSITY", "Aligned density", False),
-        ))
+        payload = {"reference": self.raster_path(parameters, "REFERENCE", context, reference=True)}
+        layers = []
+        for name, key, output, label in (
+            ("IMAGE", "img", "ALIGNED_IMAGE", "Aligned imagery"),
+            ("CHM", "chm", "ALIGNED_CHM", "Aligned canopy height"),
+            ("DENSITY", "den", "ALIGNED_DENSITY", "Aligned density"),
+            ("INTENSITY", "intensity", "ALIGNED_INTENSITY", "Aligned intensity"),
+        ):
+            if parameters.get(name) not in (None, ""):
+                payload[key] = self.raster_path(parameters, name, context, image=name == "IMAGE", allow_reprojection=True)
+                layers.append((output, label, False))
+        if not layers:
+            raise QgsProcessingException("Choose at least one raster to align to the reference.")
+        return self.execute(payload, parameters, context, feedback, inputs=list(payload.values()), layers=layers)
 
 
 class CostSurfaceAlgorithm(WorkflowStep):
@@ -138,7 +160,8 @@ class CostSurfaceAlgorithm(WorkflowStep):
             "Build a 0–1 boundary-cost raster from aligned imagery and CHM. Higher costs indicate likely "
             "crown boundaries. Relative weights are normalized; the NDVI term is used only when a NIR band "
             "is selected under Advanced. RGB and texture band choices should match training. Run Align input "
-            "rasters first if the grids differ. Output: cost.tif in a new or empty folder."
+            "rasters first if the grids differ. Saves cost.tif and cost.workflow.json. The output folder "
+            "can contain your inputs or other results; existing output files are never overwritten."
         )
 
     def initAlgorithm(self, config=None):
@@ -172,7 +195,8 @@ class SeedsAlgorithm(WorkflowStep):
             "The peak threshold applies to both height and density values, so density units matter. "
             "Outputs editable seed points. Inspect, move, add, or delete points before Generate crown proposals; "
             "that tool uses your chosen seed layer and does not regenerate seeds. "
-            "All three rasters must share a projected metre grid. Choose a new or empty output folder."
+            "All three rasters must share a projected metre grid. Saves seeds.gpkg and seeds.workflow.json. "
+            "The output folder can contain your inputs or other results; existing output files are never overwritten."
         )
 
     def initAlgorithm(self, config=None):

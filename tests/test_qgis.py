@@ -232,7 +232,7 @@ class QgisTests(unittest.TestCase):
     def test_preparation_steps_apply_defaults_and_load_outputs(self):
         from samstars_qgis.algorithms.steps import AlignRastersAlgorithm, CostSurfaceAlgorithm, SeedsAlgorithm
         cases = (
-            (AlignRastersAlgorithm, {"REFERENCE_IMAGE": "img.tif", "ALIGNED_CHM": "chm.tif", "ALIGNED_DENSITY": "den.tif"}, ("chm.tif", "den.tif")),
+            (AlignRastersAlgorithm, {"REFERENCE_RASTER": "reference.tif", "ALIGNED_IMAGE": "img.tif", "ALIGNED_CHM": "chm.tif", "ALIGNED_DENSITY": "den.tif"}, ("img.tif", "chm.tif", "den.tif")),
             (CostSurfaceAlgorithm, {"COST": "cost.tif"}, ("cost.tif",)),
             (SeedsAlgorithm, {"SEEDS": "seeds.gpkg"}, ("seeds.gpkg",)),
         )
@@ -240,7 +240,7 @@ class QgisTests(unittest.TestCase):
             with self.subTest(step=cls.__name__):
                 algorithm = cls()
                 algorithm.initAlgorithm()
-                params = {**self.parameters, "COST": self.parameters["CHM"]}
+                params = {**self.parameters, "COST": self.parameters["CHM"], "REFERENCE": self.parameters["CHM"]}
                 with patch("samstars_qgis.algorithms.common.call_engine", return_value={"OUTPUT": params["OUTPUT"], **outputs}) as engine:
                     result, ok = algorithm.run(params, self.context, self.feedback)
                 self.assertTrue(ok)
@@ -256,6 +256,94 @@ class QgisTests(unittest.TestCase):
                     self.assertEqual(payload["seed_settings"]["d_min"], 4.5)
                     self.assertEqual(payload["seed_settings"]["min_dist_px"], 4)
                     self.assertEqual(payload["thin_distance"], .8)
+
+    def test_cost_and_seed_dialogs_accept_existing_input_folders(self):
+        from samstars_qgis.algorithms.steps import CostSurfaceAlgorithm, SeedsAlgorithm
+        (self.root / "workflow.json").write_text("previous alignment settings")
+        for cls, key, filename in ((CostSurfaceAlgorithm, "COST", "cost.tif"), (SeedsAlgorithm, "SEEDS", "seeds.gpkg")):
+            with self.subTest(step=cls.__name__):
+                algorithm = cls()
+                algorithm.initAlgorithm()
+                params = {**self.parameters, "COST": self.parameters["CHM"], "OUTPUT": str(self.root)}
+                outputs = {"OUTPUT": str(self.root), key: str(self.root / filename)}
+                with patch("samstars_qgis.algorithms.common.call_engine", return_value=outputs) as engine:
+                    result, ok = algorithm.run(params, self.context, self.feedback)
+                self.assertTrue(ok)
+                self.assertEqual(result, outputs)
+                self.assertEqual(engine.call_args.args[1]["out"], str(self.root))
+                self.assertIn(outputs[key], self.context.layersToLoadOnCompletion())
+        self.assertEqual((self.root / "workflow.json").read_text(), "previous alignment settings")
+
+    def test_cost_and_seed_dialogs_name_conflicting_output_files(self):
+        from samstars_qgis.algorithms.steps import CostSurfaceAlgorithm, SeedsAlgorithm
+        for cls, filenames in (
+            (CostSurfaceAlgorithm, ("cost.tif", "cost.workflow.json")),
+            (SeedsAlgorithm, ("seeds.gpkg", "seeds.workflow.json")),
+        ):
+            algorithm = cls()
+            algorithm.initAlgorithm()
+            params = {**self.parameters, "COST": self.parameters["CHM"], "OUTPUT": str(self.root)}
+            for name in filenames:
+                with self.subTest(step=cls.__name__, filename=name):
+                    path = self.root / name
+                    path.write_bytes(b"existing result or settings")
+                    with patch("samstars_qgis.algorithms.common.call_engine") as engine:
+                        with self.assertRaisesRegex(QgsProcessingException, name):
+                            algorithm.processAlgorithm(params, self.context, self.feedback)
+                        engine.assert_not_called()
+                    self.assertEqual(path.read_bytes(), b"existing result or settings")
+                    path.unlink()
+
+    def test_alignment_accepts_each_optional_input_independently(self):
+        from samstars_qgis.algorithms.steps import AlignRastersAlgorithm
+        for name, key, output in (("IMAGE", "img", "ALIGNED_IMAGE"), ("CHM", "chm", "ALIGNED_CHM"),
+                                  ("DENSITY", "den", "ALIGNED_DENSITY"), ("INTENSITY", "intensity", "ALIGNED_INTENSITY")):
+            with self.subTest(name=name):
+                algorithm = AlignRastersAlgorithm()
+                algorithm.initAlgorithm()
+                params = {"REFERENCE": self.parameters["CHM"], "OUTPUT": self.parameters["OUTPUT"],
+                          name: self.parameters.get(name, self.parameters["DENSITY"])}
+                for other in ("IMAGE", "CHM", "DENSITY", "INTENSITY"):
+                    params.setdefault(other, None)
+                outputs = {"OUTPUT": params["OUTPUT"], "REFERENCE_RASTER": str(self.root / "CHM.tif"),
+                           output: str(self.root / f"aligned_{name}.tif")}
+                with patch("samstars_qgis.algorithms.common.call_engine", return_value=outputs) as engine:
+                    result, ok = algorithm.run(params, self.context, self.feedback)
+                self.assertTrue(ok)
+                self.assertEqual(result, outputs)
+                payload = engine.call_args.args[1]
+                self.assertEqual(set(payload), {"reference", key, "out"})
+                self.assertEqual(payload["reference"], str(self.root / "CHM.tif"))
+                self.assertIn(outputs[output], self.context.layersToLoadOnCompletion())
+
+    def test_alignment_requires_at_least_one_optional_input(self):
+        from samstars_qgis.algorithms.steps import AlignRastersAlgorithm
+        algorithm = AlignRastersAlgorithm()
+        algorithm.initAlgorithm()
+        with patch("samstars_qgis.algorithms.common.call_engine") as engine:
+            with self.assertRaisesRegex(QgsProcessingException, "at least one"):
+                algorithm.processAlgorithm({"REFERENCE": self.parameters["CHM"], "OUTPUT": self.parameters["OUTPUT"]},
+                                           self.context, self.feedback)
+            engine.assert_not_called()
+
+    def test_alignment_reprojects_geographic_imagery_but_requires_projected_reference(self):
+        from samstars_qgis.algorithms.steps import AlignRastersAlgorithm
+        path = self.root / "geographic.tif"
+        dataset = gdal.Translate(str(path), str(self.root / "IMAGE.tif"), outputSRS="EPSG:4326")
+        dataset.SetGeoTransform((-156, .00001, 0, 20, 0, -.00001))
+        dataset = None
+        layer = QgsRasterLayer(str(path), "Geographic imagery")
+        self.assertTrue(layer.isValid())
+        self.project.addMapLayer(layer)
+        algorithm = AlignRastersAlgorithm()
+        algorithm.initAlgorithm()
+        params = {"REFERENCE": self.parameters["CHM"], "IMAGE": layer.id(), "OUTPUT": self.parameters["OUTPUT"]}
+        outputs = {"OUTPUT": params["OUTPUT"], "REFERENCE_RASTER": str(self.root / "CHM.tif"), "ALIGNED_IMAGE": "aligned.tif"}
+        with patch("samstars_qgis.algorithms.common.call_engine", return_value=outputs):
+            _, ok = algorithm.run(params, self.context, self.feedback)
+        self.assertTrue(ok)
+        with self.assertRaisesRegex(QgsProcessingException, "projected CRS"):
+            algorithm.processAlgorithm({**params, "REFERENCE": layer.id()}, self.context, self.feedback)
 
     def test_proposals_use_selected_unsaved_seed_edits(self):
         from samstars_qgis.algorithms.steps import ProposalsAlgorithm

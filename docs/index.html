@@ -112,36 +112,52 @@
   <h2 id="steps">Workflow steps</h2>
   <p>Open <strong>SAMStars → Workflow steps</strong> in the Processing Toolbox.
     Each tool has its own dialog and saves outputs for inspection and reuse.
-    Choose a permanent, new or empty folder for each run. The first three steps
+    Choose a permanent output folder to keep the results. The first three steps
     need no model; proposals and refinement use a trained bundle. These tools
     use existing rasters and do not derive CHM/density from raw point clouds.</p>
 
   <h3 id="alignrasters">1. Align input rasters</h3>
-  <p>Choose imagery, canopy height, and first-return density. The imagery defines
-    the grid; it must use a projected CRS in metres and north-up square pixels.
-    Bilinear resampling writes <code>chm.tif</code> and <code>den.tif</code> to that
-    grid and loads them. <code>REFERENCE_IMAGE</code> points to the original
-    imagery, retaining all its bands. Use the aligned CHM/density downstream.
-    Skip alignment if all grids already match. This does not fix survey offsets.</p>
+  <p>Choose a required <strong>Reference raster</strong> to define the output CRS,
+    extent, resolution, and pixel grid. It must use a projected CRS in metres
+    and north-up square pixels. Then select any of the four optional inputs:
+    <strong>Imagery</strong>, <strong>Canopy height</strong>, <strong>First-return
+    density</strong>, and <strong>Intensity</strong>. Select at least one.</p>
+  <p>To use the CHM grid, select the CHM as reference and provide imagery, density,
+    and intensity. The optional CHM input can stay blank: use the original CHM
+    downstream. Selecting it as an input as well produces a separate copy on
+    the same grid. Any suitable single-band or multiband raster can be the reference.</p>
+  <p>Selected inputs produce <code>img.tif</code>, <code>chm.tif</code>,
+    <code>den.tif</code>, or <code>intensity.tif</code>, and are loaded into QGIS.
+    Every imagery band is preserved in its original order. Outputs are Float32;
+    differing grids use bilinear resampling, and matching grids are copied
+    without interpolation. <code>REFERENCE_RASTER</code> points to the original
+    reference file. Skip alignment if all grids already match. This matches
+    pixel grids and does not fix survey offsets.</p>
 
   <h3 id="costsurface">2. Build cost surface</h3>
-  <p>Select the original imagery and aligned CHM. Set the relative height-edge,
+  <p>Select imagery and CHM on the chosen reference grid, such as the aligned
+    imagery and original reference CHM. Set the relative height-edge,
     NDVI-gap, and texture weights; available terms are normalized. Under Advanced,
     choose RGB, NIR, and texture bands to match training. Without NIR, NDVI is
     omitted. <code>cost.tif</code> is loaded with values from 0 to 1; higher values
     indicate stronger boundary cues. Later steps require exactly matching grids.</p>
+  <p>The output folder can contain the input rasters or other results.
+    <code>cost.tif</code> and <code>cost.workflow.json</code> must not already exist;
+    the tool names any conflicting file instead of overwriting it.</p>
 
   <h3 id="generateseeds">3. Generate seed points</h3>
   <p>Select aligned CHM, density, and cost. Adjust the minimum peak value,
     minimum canopy height, peak-search radius, Gaussian smoothing, and candidate
     merge radius. The peak threshold applies to both CHM and density, so density
     units matter. Advanced includes cost penalty, height splitting, and final
-    thinning. The result is an editable <code>seeds.gpkg</code>.</p>
+    thinning. The result is an editable <code>seeds.gpkg</code>. You can save it
+    alongside the inputs and cost surface, provided <code>seeds.gpkg</code> and
+    <code>seeds.workflow.json</code> do not already exist.</p>
   <p>Inspect the seeds over the imagery. Move, add, or delete points using QGIS
     editing tools before proceeding. You can also select a subset for proposals.</p>
 
   <h3 id="proposals">4. Generate crown proposals (SAM)</h3>
-  <p>Select the original imagery, aligned CHM, cost, edited seeds, and model
+  <p>Select imagery and CHM on the reference grid, cost, edited seeds, and model
     bundle. Selections, filters, and unsaved seed edits are exported. Seeds and
     costs are used as supplied. RGB bands default to the model settings;
     Advanced exposes device, prompt batching, and smoothing. CPU is the default;
@@ -170,10 +186,15 @@
     independently in the full workflows; the separate Refine crowns tool
     explicitly uses CPU in every environment. Start with a small
     area: large scenes and training can need substantial memory and time.</p>
-  <p>Outputs must be new or empty folders. Full segmentation/training removes
+  <p>Cost and seed creation allow existing output folders while protecting their
+    specific result and settings files. Alignment, proposals, refinement, training,
+    and full segmentation require new or empty output folders, separate from
+    their inputs and model bundle. Full segmentation/training removes
     intermediate files unless <strong>Keep intermediate files</strong> is checked.
     Workflow steps retain their outputs and prepared inputs, with requested
-    settings and output paths in <code>workflow.json</code>. Choose a permanent
+    settings and output paths in <code>cost.workflow.json</code> for costs,
+    <code>seeds.workflow.json</code> for seeds, and <code>workflow.json</code> for
+    other steps. Choose a permanent
     output folder to retain results beyond the session. Cancel stops the worker
     and its child processes on Linux/macOS; partial output or temporary files
     can remain. Use a fresh folder for another run. Prepared-tile batch workflows

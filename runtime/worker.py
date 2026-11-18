@@ -167,30 +167,43 @@ def check_gpu(device):
     }
 
 
-def validate_output(path, inputs):
-    """Reject reuse and containment before SAMStars can replace final outputs."""
+def _check_output_files(output, filenames):
+    for name in filenames:
+        path = output / name
+        if path.exists() or path.is_symlink():
+            raise ValueError(f"Output file already exists: {path}. Choose a different output folder or move the existing file.")
+
+
+def validate_output(path, inputs, *, filenames=None):
+    """Protect whole run folders, or just the named files for a standalone step."""
     output = Path(path).expanduser().resolve()
     for value in inputs:
         source = Path(value).resolve()
-        if output == source or output in source.parents or (source.is_dir() and source in output.parents):
+        if output == source or (filenames is None and output in source.parents) or (source.is_dir() and source in output.parents):
             raise ValueError("Output must be separate from input files and the model bundle.")
-    if output.exists() and (not output.is_dir() or any(output.iterdir())):
+    if output.exists() and not output.is_dir():
+        raise ValueError(f"Output must be a folder: {output}.")
+    if filenames is not None:
+        _check_output_files(output, filenames)
+    elif output.exists() and any(output.iterdir()):
         raise ValueError("Choose a new or empty output folder. Existing runs are never overwritten.")
     return output
 
 
 @contextmanager
-def claim_output(output):
-    """Avoid two Processing jobs writing to the same new destination."""
+def claim_output(output, *, filenames=None):
+    """Lock the destination and recheck its files immediately before writing."""
     output.mkdir(parents=True, exist_ok=True)
     marker = output / ".samstars-running"
     try:
         with marker.open("x", encoding="utf-8") as stream:
             stream.write(str(os.getpid()))
     except FileExistsError as exc:
-        raise ValueError("Another SAMStars run is using this output folder. Choose a new folder.") from exc
+        raise ValueError("Another SAMStars run is using this output folder. Wait for it to finish or choose a different folder.") from exc
     try:
-        if any(path != marker for path in output.iterdir()):
+        if filenames is not None:
+            _check_output_files(output, filenames)
+        elif any(path != marker for path in output.iterdir()):
             raise ValueError("Output folder is no longer empty. Choose a new folder.")
         yield
     finally:

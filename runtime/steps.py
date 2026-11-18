@@ -1,4 +1,4 @@
-"""Independent scientific steps, loaded only inside the isolated worker."""
+"""Independent steps; scientific libraries are imported only when a step runs."""
 
 from contextlib import ExitStack
 import json
@@ -8,6 +8,15 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+
+
+# These steps can share an existing folder. Reserve both the result and its
+# settings record so one step never replaces another step's provenance.
+SHARED_OUTPUT_FILES = {
+    "costsurface": ("cost.tif", "cost.workflow.json"),
+    "generateseeds": ("seeds.gpkg", "seeds.workflow.json"),
+}
+
 
 def number(value, name, *, minimum=0, maximum=None, integer=False):
     if isinstance(value, bool) or not isinstance(value, (float, int)) or not math.isfinite(value):
@@ -87,30 +96,54 @@ def align_rasters(p, out, emit):
     from rasterio.vrt import WarpedVRT
     from rasterio.warp import transform_bounds
 
-    result = {"REFERENCE_IMAGE": str(Path(p["img"]).resolve())}
-    with rasterio.open(p["img"]) as ref:
-        _reference(ref, image=True)
-        for index, (key, output) in enumerate((("chm", "ALIGNED_CHM"), ("den", "ALIGNED_DENSITY"))):
+    selected = [(key, output) for key, output in (
+        ("img", "ALIGNED_IMAGE"), ("chm", "ALIGNED_CHM"),
+        ("den", "ALIGNED_DENSITY"), ("intensity", "ALIGNED_INTENSITY"),
+    ) if p.get(key)]
+    if not selected:
+        raise ValueError("Choose at least one raster to align to the reference.")
+    result = {"REFERENCE_RASTER": str(Path(p["reference"]).resolve())}
+    with rasterio.open(p["reference"]) as ref:
+        _reference(ref)
+        for index, (key, output) in enumerate(selected):
             with rasterio.open(p[key]) as source:
-                _single(source, key)
+                if key == "img":
+                    if not source.crs or source.count < 3:
+                        raise ValueError("Imagery needs at least three bands and a defined CRS.")
+                else:
+                    _single(source, key)
                 bounds = transform_bounds(source.crs, ref.crs, *source.bounds)
                 if bounds[0] >= ref.bounds.right or bounds[2] <= ref.bounds.left or bounds[1] >= ref.bounds.top or bounds[3] <= ref.bounds.bottom:
-                    raise ValueError(f"{key} does not overlap the imagery.")
+                    raise ValueError(f"{key} does not overlap the reference raster.")
                 path = out / f"{key}.tif"
-                profile = dict(driver="GTiff", width=ref.width, height=ref.height, count=1,
+                profile = dict(driver="GTiff", width=ref.width, height=ref.height, count=source.count,
                                crs=ref.crs, transform=ref.transform, dtype="float32", nodata=-9999.0,
                                tiled=True, compress="deflate", BIGTIFF="IF_SAFER")
-                with WarpedVRT(source, crs=ref.crs, transform=ref.transform, width=ref.width,
-                               height=ref.height, dtype="float32", nodata=-9999.0,
-                               resampling=Resampling.bilinear) as vrt, rasterio.open(path, "w", **profile) as dest:
+                same_grid = (source.crs, source.transform, source.width, source.height) == (
+                    ref.crs, ref.transform, ref.width, ref.height,
+                )
+                with ExitStack() as stack:
+                    reader = source if same_grid else stack.enter_context(WarpedVRT(
+                        source, crs=ref.crs, transform=ref.transform, width=ref.width, height=ref.height,
+                        dtype="float32", nodata=-9999.0, resampling=Resampling.bilinear,
+                    ))
+                    dest = stack.enter_context(rasterio.open(path, "w", **profile))
                     for _, window in dest.block_windows(1):
-                        data = vrt.read(1, window=window, masked=True).filled(-9999.0)
-                        data[~np.isfinite(data)] = -9999.0
-                        dest.write(data, 1, window=window)
+                        for band in range(1, source.count + 1):
+                            data = reader.read(band, window=window, masked=True).astype("float32").filled(-9999.0)
+                            data[~np.isfinite(data)] = -9999.0
+                            dest.write(data, band, window=window)
+                    dest.colorinterp = source.colorinterp
+                    dest.scales, dest.offsets = source.scales, source.offsets
+                    for band in range(1, source.count + 1):
+                        if source.descriptions[band - 1]:
+                            dest.set_band_description(band, source.descriptions[band - 1])
+                        if source.units[band - 1]:
+                            dest.set_band_unit(band, source.units[band - 1])
                     if key == "chm":
                         dest.set_band_unit(1, "m")
                 result[output] = str(path)
-            emit(f"Aligned {key} to the imagery grid.", 40 + index * 40)
+            emit(f"Aligned {key} to the reference grid.", 10 + 80 * (index + 1) / len(selected))
     return result
 
 
@@ -435,19 +468,24 @@ def refine(p, out, emit):
 def run_step(operation, payload, *, emit, validate_output, claim_output):
     p = dict(payload)
     keys = {
-        "alignrasters": ("img", "chm", "den"), "costsurface": ("img", "chm"),
+        "alignrasters": ("reference",), "costsurface": ("img", "chm"),
         "generateseeds": ("chm", "den", "cost"),
         "proposals": ("img", "chm", "cost", "seeds", "model"), "refine": ("records", "model"),
     }[operation]
     inputs = [p[key] for key in keys]
+    if operation == "alignrasters":
+        inputs += [p[key] for key in ("img", "chm", "den", "intensity") if p.get(key)]
     if operation == "refine":
         p["_records"] = read_proposal_records(p["records"])
         inputs += [record[key] for record in p["_records"] for key in RASTER_FIELDS]
-    out = validate_output(p["out"], inputs)
+    filenames = SHARED_OUTPUT_FILES.get(operation)
+    out = validate_output(p["out"], inputs, filenames=filenames)
     functions = {"alignrasters": align_rasters, "costsurface": cost_surface, "generateseeds": generate_seeds,
                  "proposals": proposals, "refine": refine}
-    with claim_output(out):
+    with claim_output(out, filenames=filenames):
         result = {"OUTPUT": str(out), **functions[operation](p, out, emit)}
-        (out / "workflow.json").write_text(json.dumps({"step": operation, "parameters": payload, "outputs": result}, indent=2, allow_nan=False), encoding="utf-8")
+        record = filenames[-1] if filenames else "workflow.json"
+        with (out / record).open("x", encoding="utf-8") as stream:
+            json.dump({"step": operation, "parameters": payload, "outputs": result}, stream, indent=2, allow_nan=False)
     emit("Workflow step finished.", 100)
     return result

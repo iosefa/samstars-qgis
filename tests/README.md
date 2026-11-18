@@ -37,7 +37,7 @@ separate supported Python environment with `samstars==0.2.0`:
 CUDA_VISIBLE_DEVICES=-1 /path/to/engine/bin/python -m unittest discover -s tests -p 'test_steps.py' -v
 ```
 
-`test_steps.py` runs four standard-library contract tests without an engine.
+`test_steps.py` runs six standard-library contract tests without an engine.
 Its scientific cases cover real alignment across different grids/CRSs, NoData,
 cost weighting and bands, seed controls and empty results, edited points, and
 the proposal handoff. SAM inference alone is substituted. A tiny deterministic
@@ -46,6 +46,20 @@ including auxiliary normalization, window overlap, duplicate suppression,
 GeoPackage output, and geometry repair that preserves crown identity and area.
 This validates integration, not the accuracy of a trained crown model. The
 tests create fixtures in temporary directories and do not alter engine packages.
+
+Alignment tests cover a user-chosen single-band or multiband reference, each
+optional input on its own, rejection of an empty selection, protection of optional
+input paths, geographic imagery, and a real isolated run that aligns eight-band
+imagery, CHM, density, and intensity across different resolutions and CRSs.
+They verify that the original reference is unchanged, all image bands and band
+descriptions survive, and NoData is retained.
+
+Cost and seed tests cover saving alongside inputs and earlier results, separate
+settings records, specific filename conflicts, concurrent-job locking, files
+created after validation, input aliases and dangling symlinks, and failure cleanup.
+An isolated engine test creates a real cost raster and seed GeoPackage in the
+input folder, then confirms that repeat runs cannot overwrite them and that
+source files and earlier settings remain byte-for-byte unchanged.
 
 No tests download checkpoints or run model training. Full model runs require
 the user's imagery, CHM, density, annotations, and a ViT-L checkpoint or trained
@@ -121,6 +135,20 @@ tests**. All five Processing forms also opened successfully in QGIS 4.2.3.
 The real refinement check produced 25 synthetic crown polygons and verified
 that the returned geometries were valid. This revision did not reinstall or
 modify the existing engine or repeat the GPU installer test.
+
+The selectable-reference alignment revision passed 40 runtime tests, 32 QGIS
+integration tests, five workflow contract tests, and three scientific alignment
+tests. A real eight-band scene was aligned to its 0.5 m CHM grid; all three
+selected outputs matched that grid, and already matching density/intensity
+pixels were preserved exactly. The revised Processing form was also checked
+in QGIS 4.2.3.
+
+The shared-folder cost/seed revision passed 45 runtime tests, 34 QGIS 4.2.3
+integration tests, six workflow contract tests, and four scientific cases
+covering costs, seeds, shared-folder execution, and the proposal handoff.
+Both outputs were generated through the isolated worker in the input folder;
+repeat runs were rejected and inputs, results, and earlier records were
+unchanged. The existing engine packages and QGIS engine selection were preserved.
 
 Before promoting GPU setup out of experimental status, validate on real release
 targets (Linux NVIDIA cu126, Linux NVIDIA cu128, and Apple Silicon MPS):

@@ -97,12 +97,12 @@ class SamStarsAlgorithm(QgsProcessingAlgorithm):
         payload["storage"] = "persistent" if self.parameterAsBool(parameters, "KEEP_INTERMEDIATES", context) else "temp"
         return payload
 
-    def output_path(self, parameters, context, inputs):
+    def output_path(self, parameters, context, inputs, *, filenames=None):
         path = self.parameterAsString(parameters, "OUTPUT", context)
         if not path or path == "TEMPORARY_OUTPUT":
             path = self.parameterDefinition("OUTPUT").generateTemporaryDestination(context)
         try:
-            return str(validate_output(path, inputs))
+            return str(validate_output(path, inputs, filenames=filenames))
         except (ValueError, OSError) as exc:
             raise QgsProcessingException(str(exc)) from exc
 

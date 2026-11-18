@@ -4,7 +4,7 @@ Train models and segment individual tree crowns in the **QGIS Processing
 Toolbox**. The plugin follows the PyForestScan QGIS plugin: ordinary Processing
 dialogs, batch/model support, and one small setup dialog.
 
-Requires **QGIS 4.0 or later**. Version **0.1.3 is experimental**.
+Requires **QGIS 4.0 or later**. Version **0.1.5 is experimental**.
 Scientific libraries run in a separate Python
 3.10–3.12 environment.
 
@@ -117,7 +117,7 @@ as a QGIS plugin. Restart QGIS after updating the plugin.
 | --- | --- | --- |
 | Segment tree crowns | `samstars:segment` | Crown GeoPackage, automatically loaded into the project |
 | Train a model | `samstars:train` | Reusable model bundle folder |
-| Align input rasters | `samstars:alignrasters` | CHM and density aligned to the original imagery |
+| Align input rasters | `samstars:alignrasters` | Selected rasters aligned to a user-chosen reference grid |
 | Build cost surface | `samstars:costsurface` | Boundary-cost raster |
 | Generate seed points | `samstars:generateseeds` | Editable seed GeoPackage |
 | Generate crown proposals (SAM) | `samstars:proposals` | Proposal records, probability, and canopy-index rasters |
@@ -165,23 +165,34 @@ can still select its own devices.
 
 Use **SAMStars → Workflow steps** to inspect results and adjust settings between
 stages. Each tool opens its own Processing dialog and saves its outputs. Choose
-a permanent, new or empty folder for each run. The first three steps need no
+a permanent output folder to keep the results. The first three steps need no
 model bundle; proposal generation and refinement use a trained bundle.
 
-1. **Align input rasters:** choose the original imagery, CHM, and density.
-   The tool writes `chm.tif` and `den.tif` using bilinear resampling. Use those
-   aligned rasters downstream. `REFERENCE_IMAGE` points to the original imagery,
-   preserving all its bands. Skip this step if the grids already match exactly.
-2. **Build cost surface:** use the original imagery and aligned CHM. Set relative
+1. **Align input rasters:** choose a **Reference raster**, then any of the four
+   optional inputs: **Imagery**, **CHM**, **First-return density**, and **Intensity**.
+   Select at least one input. The reference defines the CRS, extent, resolution,
+   and pixel grid, and must be north-up with square pixels in a projected CRS
+   in metres. For a CHM-based grid, select the CHM as reference and supply imagery,
+   density, and intensity; leave the optional CHM input blank to reuse its source.
+   Selected inputs produce `img.tif`, `chm.tif`, `den.tif`, or `intensity.tif`.
+   Every imagery band is retained in its original order. Outputs are Float32;
+   differing grids use bilinear resampling, while matching grids are copied
+   without interpolation. `REFERENCE_RASTER` points to the original reference.
+   Skip this step if the grids already match exactly.
+2. **Build cost surface:** use imagery and CHM on the chosen reference grid
+   (for example, the aligned imagery and original reference CHM). Set relative
    height-edge, NDVI-gap, and texture weights. Select RGB, NIR, and texture bands
    under Advanced to match training; NDVI is omitted without a NIR band.
-   The result is `cost.tif`, with valid values from 0 to 1.
+   The result is `cost.tif`, with valid values from 0 to 1. You can save it in
+   the input folder, provided `cost.tif` and `cost.workflow.json` do not already exist.
 3. **Generate seed points:** use aligned CHM/density and the cost surface. Controls
    include the peak threshold (applied to both CHM and density), minimum canopy
    height, search radius, smoothing, and merge radius. Advanced exposes cost
    penalties, height splitting, and final thinning. Inspect `seeds.gpkg` in QGIS
-   and move, add, or delete points as needed.
-4. **Generate crown proposals (SAM):** select the original imagery, aligned CHM,
+   and move, add, or delete points as needed. You can use the same folder as
+   the inputs and cost surface, provided `seeds.gpkg` and `seeds.workflow.json`
+   do not already exist.
+4. **Generate crown proposals (SAM):** select imagery and CHM on the reference grid,
    cost surface, edited seed layer, and trained model bundle. Selected features,
    layer filters, and unsaved edits are exported; seeds and costs are not
    regenerated. RGB defaults come from the bundle. Advanced offers CUDA/MPS,
@@ -199,16 +210,19 @@ The dialogs reject grid mismatches instead of silently resampling later inputs.
 Proposals ignore seeds outside the image extent and report how many were skipped;
 seeds on missing CHM/cost data must be corrected. Keep proposal folders and their
 rasters in place: the records refer to those files. Step outputs and prepared
-inputs are retained, and `workflow.json` records the requested settings and
-outputs. Temporary Processing destinations still expire with the session.
+inputs are retained. Requested settings and outputs are recorded in
+`cost.workflow.json` for costs, `seeds.workflow.json` for seeds, and
+`workflow.json` for the other steps. Temporary Processing destinations still expire with the session.
 Use new output folders to compare seed or refinement settings.
 
 These tools operate on existing imagery/CHM/density rasters. They do not generate
 CHM or density from raw point clouds. Model training remains the separate
 **Train a model** workflow.
 
-Choose **new or empty output folders**. The plugin rejects reuse and output
-paths that contain inputs or lie inside the model bundle. Intermediate files
+Cost and seed creation accept existing folders and protect their specific result
+and settings files from being overwritten. Alignment, proposals, refinement,
+training, and full segmentation require **new or empty output folders**, separate
+from their inputs and model bundle. Intermediate files
 in the full segmentation/training tools are temporary unless **Keep intermediate
 files** is enabled; Workflow steps retain theirs. A canceled job
 can leave partial outputs; choose a new folder for the next run. Temporary

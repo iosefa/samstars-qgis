@@ -147,10 +147,11 @@ class OutputTests(unittest.TestCase):
 
     def test_output_claim_is_exclusive_and_cleans_up(self):
         output = self.root / "new"
-        with worker.claim_output(output):
-            with self.assertRaisesRegex(ValueError, "Another SAMStars run"):
-                with worker.claim_output(output):
-                    self.fail("Concurrent job acquired the same output")
+        for filenames in (None, ("cost.tif", "cost.workflow.json")):
+            with self.subTest(filenames=filenames), worker.claim_output(output, filenames=filenames):
+                with self.assertRaisesRegex(ValueError, "Another SAMStars run"):
+                    with worker.claim_output(output, filenames=filenames):
+                        self.fail("Concurrent job acquired the same output")
         self.assertFalse((output / ".samstars-running").exists())
 
     def test_output_claim_rechecks_after_validation(self):
@@ -162,6 +163,69 @@ class OutputTests(unittest.TestCase):
                 pass
         self.assertTrue((output / "late-result").is_file())
         self.assertFalse((output / ".samstars-running").exists())
+
+    def test_named_outputs_allow_inputs_and_other_results_in_the_folder(self):
+        image = self.root / "image.tif"
+        image.write_bytes(b"original input")
+        record = self.root / "workflow.json"
+        record.write_bytes(b"previous step")
+        files = ("cost.tif", "cost.workflow.json")
+        output = worker.validate_output(self.root, [image], filenames=files)
+        with worker.claim_output(output, filenames=files):
+            (output / "cost.tif").write_bytes(b"result")
+        self.assertEqual(image.read_bytes(), b"original input")
+        self.assertEqual(record.read_bytes(), b"previous step")
+        self.assertFalse((output / ".samstars-running").exists())
+
+    def test_named_output_conflicts_are_rechecked_under_the_lock(self):
+        for name in ("cost.tif", "cost.workflow.json"):
+            with self.subTest(name=name):
+                files = ("cost.tif", "cost.workflow.json")
+                output = worker.validate_output(self.root, [], filenames=files)
+                path = output / name
+                path.write_bytes(b"created after validation")
+                with self.assertRaisesRegex(ValueError, name):
+                    with worker.claim_output(output, filenames=files):
+                        self.fail("Overwrote a file created after validation")
+                with self.assertRaisesRegex(ValueError, name):
+                    worker.validate_output(output, [], filenames=files)
+                self.assertEqual(path.read_bytes(), b"created after validation")
+                self.assertFalse((output / ".samstars-running").exists())
+                path.unlink()
+
+    def test_named_outputs_do_not_replace_input_files(self):
+        image = self.root / "cost.tif"
+        image.write_bytes(b"input named like the result")
+        with self.assertRaisesRegex(ValueError, "cost.tif"):
+            worker.validate_output(self.root, [image], filenames=("cost.tif", "cost.workflow.json"))
+        self.assertEqual(image.read_bytes(), b"input named like the result")
+
+    def test_named_outputs_protect_existing_and_broken_symlinks(self):
+        target = self.root / "input.tif"
+        link = self.root / "cost.tif"
+        for exists in (False, True):
+            with self.subTest(target_exists=exists):
+                if exists:
+                    target.write_bytes(b"original")
+                try:
+                    link.symlink_to(target)
+                except OSError:
+                    self.skipTest("Symlinks unavailable")
+                with self.assertRaisesRegex(ValueError, "cost.tif"):
+                    worker.validate_output(self.root, [], filenames=("cost.tif", "cost.workflow.json"))
+                self.assertTrue(link.is_symlink())
+                if exists:
+                    self.assertEqual(target.read_bytes(), b"original")
+                else:
+                    self.assertFalse(target.exists())
+                link.unlink()
+
+    def test_named_outputs_still_protect_model_directories(self):
+        model = self.root / "model"
+        model.mkdir()
+        for output in (model, model / "run"):
+            with self.subTest(output=output), self.assertRaisesRegex(ValueError, "model bundle"):
+                worker.validate_output(output, [model], filenames=("cost.tif", "cost.workflow.json"))
 
 
 class ApiContractTests(unittest.TestCase):

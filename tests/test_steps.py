@@ -16,6 +16,21 @@ SCIENTIFIC_AVAILABLE = importlib.util.find_spec("rasterio") is not None and impo
 
 
 class StepContractTests(unittest.TestCase):
+    def test_alignment_protects_optional_inputs_and_reference(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            inputs = root / "inputs"
+            inputs.mkdir()
+            reference = root / "reference.tif"
+            reference.touch()
+            intensity = inputs / "intensity.tif"
+            intensity.write_bytes(b"keep me")
+            with patch.object(steps, "align_rasters") as align, self.assertRaisesRegex(ValueError, "separate"):
+                steps.run_step("alignrasters", {"reference": str(reference), "intensity": str(intensity), "out": str(inputs)},
+                               emit=lambda *args: None, validate_output=worker.validate_output, claim_output=worker.claim_output)
+            align.assert_not_called()
+            self.assertEqual(intensity.read_bytes(), b"keep me")
+
     def test_refinement_defaults_and_explicit_whole_raster(self):
         defaults = {"stardist_prob_thr": .4, "stardist_nms_thr": .3,
                     "stardist_window_size_m": 50, "stardist_window_overlap_m": 5}
@@ -58,18 +73,43 @@ class StepContractTests(unittest.TestCase):
     def test_failed_step_releases_output_claim_without_removing_partial_results(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            out = root / "out"
+            out = root
+            image = root / "img.tif"
+            image.write_bytes(b"original input")
+            record = root / "workflow.json"
+            record.write_bytes(b"alignment settings")
 
             def fail(p, destination, emit):
-                (destination / "partial.tif").touch()
+                (destination / "cost.tif").write_bytes(b"partial result")
                 raise RuntimeError("interrupted")
 
             with patch.object(steps, "cost_surface", side_effect=fail), self.assertRaisesRegex(RuntimeError, "interrupted"):
-                steps.run_step("costsurface", {"img": str(root / "img"), "chm": str(root / "chm"), "out": str(out)},
+                steps.run_step("costsurface", {"img": str(image), "chm": str(root / "chm"), "out": str(out)},
                                emit=lambda *args: None, validate_output=worker.validate_output, claim_output=worker.claim_output)
-            self.assertTrue((out / "partial.tif").exists())
+            self.assertEqual(image.read_bytes(), b"original input")
+            self.assertEqual(record.read_bytes(), b"alignment settings")
+            self.assertEqual((out / "cost.tif").read_bytes(), b"partial result")
             self.assertFalse((out / ".samstars-running").exists())
-            self.assertFalse((out / "workflow.json").exists())
+            self.assertFalse((out / "cost.workflow.json").exists())
+
+    def test_cost_and_seed_output_conflicts_fail_before_processing(self):
+        cases = (
+            ("costsurface", "cost_surface", ("cost.tif", "cost.workflow.json")),
+            ("generateseeds", "generate_seeds", ("seeds.gpkg", "seeds.workflow.json")),
+        )
+        for operation, function, filenames in cases:
+            for name in filenames:
+                with self.subTest(step=operation, filename=name), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    target = root / name
+                    target.write_bytes(b"existing result or settings")
+                    payload = {key: str(root / f"{key}.tif") for key in ("img", "chm", "den", "cost")}
+                    payload["out"] = str(root)
+                    with patch.object(steps, function) as process, self.assertRaisesRegex(ValueError, name):
+                        steps.run_step(operation, payload, emit=lambda *args: None,
+                                       validate_output=worker.validate_output, claim_output=worker.claim_output)
+                    process.assert_not_called()
+                    self.assertEqual(target.read_bytes(), b"existing result or settings")
 
 
 @unittest.skipUnless(SCIENTIFIC_AVAILABLE, "Requires the separate SAMStars engine")
@@ -118,25 +158,69 @@ class ScientificStepTests(unittest.TestCase):
     def test_isolated_alignment_handles_resolution_crs_and_nodata(self):
         from rasterio.transform import from_bounds, from_origin
         from rasterio.warp import transform_bounds
-        coarse = self.np.full((8, 8), 12)
-        chm = self.write("coarse.tif", coarse, transform=from_origin(500000, 2200032, 2, 2))
+        imagery = self.write("coarse_image.tif", self.np.stack([self.np.full((16, 16), i) for i in range(1, 9)]),
+                             transform=from_origin(500000, 2200032, 2, 2))
+        with self.rio.open(imagery, "r+") as raster:
+            raster.set_band_description(8, "NIR2")
+        intensity = self.write("partial_intensity.tif", self.np.full((8, 8), 12),
+                               transform=from_origin(500000, 2200032, 2, 2))
+        with self.rio.open(self.payload["chm"], "r+") as raster:
+            chm = raster.read(1)
+            chm[0, 0] = -9999
+            raster.write(chm, 1)
+        original_chm = Path(self.payload["chm"]).read_bytes()
         bounds = transform_bounds("EPSG:32604", "EPSG:4326", 500000, 2200000, 500032, 2200032)
         den = self.write("geographic.tif", self.np.full((16, 16), 8), crs="EPSG:4326", transform=from_bounds(*bounds, 16, 16))
         result = client.call_with_python(sys.executable, "alignrasters", {
-            "img": self.payload["img"], "chm": chm, "den": den, "out": str(self.root / "aligned"),
+            "reference": self.payload["chm"], "img": imagery, "chm": self.payload["chm"],
+            "den": den, "intensity": intensity, "out": str(self.root / "aligned"),
         })
-        self.assertEqual(result["REFERENCE_IMAGE"], self.payload["img"])
-        for key in ("ALIGNED_CHM", "ALIGNED_DENSITY"):
+        self.assertEqual(result["REFERENCE_RASTER"], self.payload["chm"])
+        self.assertEqual(Path(self.payload["chm"]).read_bytes(), original_chm)
+        for key in ("ALIGNED_IMAGE", "ALIGNED_CHM", "ALIGNED_DENSITY", "ALIGNED_INTENSITY"):
             with self.rio.open(result[key]) as raster:
                 self.assertEqual(raster.transform, self.transform)
                 self.assertEqual(raster.shape, (32, 32))
                 self.assertEqual(raster.crs.to_epsg(), 32604)
                 if key == "ALIGNED_CHM":
+                    self.np.testing.assert_array_equal(raster.read(1), chm)
+                elif key == "ALIGNED_IMAGE":
+                    self.assertEqual(raster.count, 8)
+                    self.assertEqual(raster.descriptions[7], "NIR2")
+                    for band in range(1, 9):
+                        self.np.testing.assert_allclose(raster.read(band), band)
+                elif key == "ALIGNED_INTENSITY":
                     self.assertEqual(raster.read(1)[4, 4], 12)
                     self.assertTrue(raster.read(1, masked=True).mask[24, 24])
                 else:
                     self.assertAlmostEqual(float(raster.read(1)[16, 16]), 8)
         self.assertTrue((self.root / "aligned/workflow.json").is_file())
+
+    def test_alignment_uses_multiband_reference_with_only_density_selected(self):
+        from rasterio.transform import from_origin
+        reference = self.write("reference.tif", self.np.zeros((4, 16, 16)), transform=from_origin(500000, 2200032, 2, 2))
+        result = steps.run_step("alignrasters", {"reference": reference, "den": self.payload["den"], "out": str(self.root / "aligned")},
+                                emit=lambda *args: None, validate_output=worker.validate_output, claim_output=worker.claim_output)
+        self.assertEqual(set(result), {"OUTPUT", "REFERENCE_RASTER", "ALIGNED_DENSITY"})
+        with self.rio.open(result["ALIGNED_DENSITY"]) as raster:
+            self.assertEqual(raster.shape, (16, 16))
+            self.assertEqual(raster.transform.a, 2)
+            self.assertEqual(raster.count, 1)
+        self.assertEqual({path.name for path in (self.root / "aligned").iterdir()}, {"den.tif", "workflow.json"})
+
+    def test_alignment_rejects_empty_selection_bad_reference_and_nonoverlap(self):
+        from rasterio.transform import from_origin
+        def run(name, **params):
+            return steps.run_step("alignrasters", {"reference": self.payload["chm"], "out": str(self.root / name), **params},
+                                  emit=lambda *args: None, validate_output=worker.validate_output, claim_output=worker.claim_output)
+        with self.assertRaisesRegex(ValueError, "at least one"):
+            run("no-input")
+        reference = self.write("geographic_reference.tif", self.chm, crs="EPSG:4326")
+        with self.assertRaisesRegex(ValueError, "projected CRS"):
+            run("bad-reference", reference=reference, den=self.payload["den"])
+        outside = self.write("outside.tif", self.chm, transform=from_origin(600000, 2200032, 1, 1))
+        with self.assertRaisesRegex(ValueError, "does not overlap the reference"):
+            run("no-overlap", intensity=outside)
 
     def test_cost_surface_weights_and_grid_validation(self):
         first = self.run_step("costsurface", "height-cost", weights=[1, 0, 0])
@@ -165,6 +249,50 @@ class ScientificStepTests(unittest.TestCase):
         self.assertEqual(low_points.crs.to_epsg(), 32604)
         with self.assertRaisesRegex(ValueError, "No seed points"):
             self.run_step("generateseeds", "empty", seed_settings={**settings, "d_min": 100})
+
+    def test_isolated_cost_and_seeds_share_input_folder_without_overwriting(self):
+        import geopandas as gpd
+
+        # Keep an earlier result and alignment record beside the source rasters.
+        previous_cost = self.root / "previous_cost.tif"
+        Path(self.payload["cost"]).rename(previous_cost)
+        (self.root / "workflow.json").write_text('{"step": "alignrasters"}')
+        originals = {path: path.read_bytes() for path in self.root.iterdir() if path.is_file()}
+        cost_payload = {key: self.payload[key] for key in ("img", "chm")}
+        cost_payload.update(out=str(self.root), weights=[1, 0, 0])
+        cost = client.call_with_python(sys.executable, "costsurface", cost_payload)
+        with self.rio.open(cost["COST"]) as raster:
+            self.assertEqual(raster.transform, self.transform)
+            self.assertGreaterEqual(float(raster.read(1).min()), 0)
+            self.assertLessEqual(float(raster.read(1).max()), 1)
+        seed_payload = {
+            "chm": self.payload["chm"], "den": self.payload["den"], "cost": cost["COST"], "out": str(self.root),
+            "seed_settings": {"d_min": 5, "gauss_sigma": 0, "min_dist_px": 2, "merge_radius": 1, "min_canopy_height": 2},
+        }
+        originals[Path(cost["COST"])] = Path(cost["COST"]).read_bytes()
+        seeds = client.call_with_python(sys.executable, "generateseeds", seed_payload)
+        points = gpd.read_file(seeds["SEEDS"])
+        self.assertEqual(len(points), 2)
+        self.assertEqual(points.crs.to_epsg(), 32604)
+        for name, operation, payload, result in (
+            ("cost", "costsurface", cost_payload, cost), ("seeds", "generateseeds", seed_payload, seeds),
+        ):
+            record = self.root / f"{name}.workflow.json"
+            document = json.loads(record.read_text())
+            self.assertEqual(document["step"], operation)
+            self.assertEqual(document["parameters"], payload)
+            self.assertEqual(document["outputs"], result)
+        originals.update({path: path.read_bytes() for path in (
+            Path(seeds["SEEDS"]), self.root / "cost.workflow.json", self.root / "seeds.workflow.json",
+        )})
+        for operation, payload, filename in (
+            ("costsurface", cost_payload, "cost.tif"), ("generateseeds", seed_payload, "seeds.gpkg"),
+        ):
+            with self.subTest(step=operation), self.assertRaisesRegex(client.EngineError, filename):
+                client.call_with_python(sys.executable, operation, payload)
+        for path, content in originals.items():
+            self.assertEqual(path.read_bytes(), content, str(path))
+        self.assertFalse((self.root / ".samstars-running").exists())
 
     def test_selected_points_are_clipped_and_missing_data_rejected(self):
         crs, bounds = steps.aligned({key: self.payload[key] for key in ("chm", "cost")})

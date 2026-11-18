@@ -3,6 +3,9 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# Local raster inputs and workflow results; examples/ is tracked separately.
+/local_data/
+
 # C extensions
 *.so
 
