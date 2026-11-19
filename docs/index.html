@@ -16,12 +16,15 @@
   <p>Individual tree crowns from imagery and lidar rasters. Requires QGIS 4.0 or
     later. This experimental plugin uses the Processing Toolbox for analysis.</p>
   <nav><a href="#setup">Setup</a> · <a href="#gpu">GPU setup</a> · <a href="#segment">Segment</a> ·
-    <a href="#train">Train</a> · <a href="#steps">Workflow steps</a> · <a href="#checkdependencies">Check dependencies</a></nav>
+    <a href="#createtrainingwindow">Training preparation</a> · <a href="#train">Train</a> ·
+    <a href="#steps">Workflow steps</a> · <a href="#checkdependencies">Check dependencies</a></nav>
 
   <h2 id="setup">Set up the engine</h2>
   <ol>
     <li>Open <strong>Plugins → SAMStars → Set up SAMStars</strong>.</li>
-    <li>Click <strong>Install engine</strong>. Setup detects an installed Python
+    <li>Choose <strong>Engine version</strong>: <strong>Stable — 0.2.0</strong>
+      (default) or <strong>Experimental — 0.3.0a1</strong> for alpha testing.
+      Click <strong>Install engine</strong>. Setup detects an installed Python
       3.10–3.12 with <code>venv</code> and <code>ensurepip</code> support.</li>
     <li>Open <strong>Advanced</strong> to select Python manually or choose a
       prepared SAMStars environment and click <strong>Use existing environment</strong>.
@@ -35,6 +38,14 @@
     deletes only private environments marked as belonging to this plugin;
     external environments and older unmarked installs are kept. Keep the base
     Python installed.</p>
+  <p>To try the alpha, install the updated plugin ZIP, restart QGIS, choose
+    <strong>Experimental — 0.3.0a1</strong>, and click <strong>Repair engine</strong>.
+    This installs dependencies in a new environment while preserving your private
+    CPU/NVIDIA/Apple GPU profile. GPU setup uses the same version choice. Changing
+    the dropdown alone does not switch engines. The summary shows the active
+    engine version; previous environments remain available under
+    <strong>Advanced → Use existing environment</strong>, which detects either
+    supported release without reinstalling it.</p>
   <p>Automatic installation supports Linux x64 (Ubuntu 20.04+) and Apple Silicon
     macOS 14+, following the SAMStars supported platforms. Other platforms need
     an existing environment and are untested. Installation defaults to CPU.
@@ -95,6 +106,20 @@
   <p>This tool performs alignment, cost construction, seed generation, SAM
     proposals, and StarDist refinement automatically. Use Workflow steps below
     to adjust or inspect individual stages.</p>
+
+  <h2 id="createtrainingwindow">Create training window</h2>
+  <p>Open <strong>SAMStars → Training preparation → Create training window</strong>.
+    Enter the square's side length in metres and choose a projected CRS in metres,
+    preferably the imagery CRS. Use the <strong>centre of the current map view</strong>
+    or enter <strong>X and Y in the window CRS</strong>. Map-view coordinates are
+    transformed automatically. The default is 256 m per side, corresponding to
+    512 pixels at 0.5 m resolution.</p>
+  <p>Save the window to a GeoPackage to keep it. It appears as an outline with no
+    fill. Create a separate polygon layer and draw one polygon per crown inside
+    the guide. Fully annotate the area and <strong>crop the training rasters to it
+    before training</strong>: the boundary alone does not limit training.</p>
+  <p>This tool needs no engine. It creates only the guide; it does not crop rasters,
+    snap to their pixel grid, or set the model's SAM processing window.</p>
 
   <h2 id="train">Train a model</h2>
   <p>Run <strong>SAMStars → Tree crowns → Train a model</strong>. Select the three scene rasters,

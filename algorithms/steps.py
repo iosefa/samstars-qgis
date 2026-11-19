@@ -250,7 +250,7 @@ class ProposalsAlgorithm(WorkflowStep):
         self.model()
         self.bands(model=True)
         self.add_advanced(QgsProcessingParameterEnum("DEVICE", "SAM compute device", options=["CPU", "CUDA", "Apple MPS"], defaultValue=0))
-        self.add_advanced(QgsProcessingParameterBoolean("FAST", "Batch prompts across the scene (uses more GPU memory)", defaultValue=False))
+        self.add_advanced(QgsProcessingParameterBoolean("FAST", "Batch SAM prompts (uses more GPU memory)", defaultValue=True))
         self.number("CROP_SMOOTHING", "Per-crop smoothing (pixels, -1 = model)", -1, minimum=-1, advanced=True)
         self.number("MOSAIC_SMOOTHING", "Proposal mosaic smoothing (pixels, -1 = model)", -1, minimum=-1, advanced=True)
         self.add_output_folder("Proposal output folder")

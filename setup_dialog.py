@@ -54,7 +54,10 @@ class GpuSetupDialog(QDialog):
         self.state = state
         self.operation = ""
         layout = QVBoxLayout(self)
+        version = state.get("install_version", manager.SAMSTARS_VERSION)
         for text in (
+            f"Engine version for installation: {manager.SAMSTARS_VERSIONS[version]} — {version}. "
+            "Testing uses the currently selected engine.",
             "GPU setup is experimental. It accelerates SAM proposals and SAM training. "
             "StarDist refinement stays on CPU in private engines.",
             "Installation creates a new private engine and tests it before selection. "
@@ -128,6 +131,7 @@ class SetupDialog(QDialog):
         self._diagnosing = False
         self._outcome = ""
         self._successful = False
+        self._version_initialized = False
         layout = QVBoxLayout(self)
         layout.setSizeConstraint(QLayout.SizeConstraint.SetFixedSize)
         explanation = QLabel(
@@ -143,6 +147,20 @@ class SetupDialog(QDialog):
         self.location = QLabel()
         self.location.setWordWrap(True)
         layout.addWidget(self.location)
+        version_row = QHBoxLayout()
+        version_label = QLabel("Engine version")
+        self.engine_version = QComboBox()
+        for version, channel in manager.SAMSTARS_VERSIONS.items():
+            self.engine_version.addItem(f"{channel} — {version}", version)
+        version_label.setBuddy(self.engine_version)
+        version_row.addWidget(version_label)
+        version_row.addWidget(self.engine_version, 1)
+        layout.addLayout(version_row)
+        self.version_hint = QLabel()
+        self.version_hint.setWordWrap(True)
+        layout.addWidget(self.version_hint)
+        self.engine_version.currentIndexChanged.connect(self._version_changed)
+        self._version_changed()
         self.gpu_note = QLabel(
             "CPU is the default. GPU setup can accelerate SAM proposals; "
             "private engines keep StarDist refinement on CPU."
@@ -216,8 +234,15 @@ class SetupDialog(QDialog):
 
     def _refresh(self):
         state = manager.status()
+        version = state.get("samstars_version")
+        if not self._version_initialized:
+            index = self.engine_version.findData(version or manager.SAMSTARS_VERSION)
+            self.engine_version.setCurrentIndex(max(0, index))
+            self._version_initialized = True
         if state["installed"]:
             summary = "Private engine selected." if state["managed"] else "An existing Python environment is selected."
+            if version in manager.SAMSTARS_VERSIONS:
+                summary += f" SAMStars {version} ({manager.SAMSTARS_VERSIONS[version]})."
             if state["managed"] and state.get("accelerator") in ("cuda", "mps"):
                 summary += " GPU profile: " + state["accelerator"].upper() + "; refinement: CPU."
         else:
@@ -232,6 +257,7 @@ class SetupDialog(QDialog):
         )
         self.install_button.setText("Repair engine" if state["managed"] else "Install engine")
         self.install_button.setEnabled(not state["error"] and not state["override"])
+        self.engine_version.setEnabled(not state["override"])
         self.remove_button.setEnabled(state["removable"] and not state["override"])
         self.existing_button.setEnabled(not state["override"])
         self.python.setEnabled(not state["override"])
@@ -246,6 +272,12 @@ class SetupDialog(QDialog):
             )
         else:
             self.message.setText(state["error"] or self._outcome or state.get("warning", ""))
+
+    def _version_changed(self):
+        text = "Choose the version to install. Previous engines are kept; the new engine is selected only after validation."
+        if self.engine_version.currentData() != manager.SAMSTARS_VERSION:
+            text = "Experimental releases are for testing. " + text
+        self.version_hint.setText(text)
 
     def _browse(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -265,10 +297,14 @@ class SetupDialog(QDialog):
         if accelerator is None:
             state = manager.status()
             accelerator = state.get("accelerator", "cpu") if state["managed"] else "cpu"
-        self._start(lambda **kwargs: manager.install_engine(python, root, accelerator=accelerator, **kwargs))
+        version = self.engine_version.currentData()
+        self._start(lambda **kwargs: manager.install_engine(
+            python, root, accelerator=accelerator, samstars_version=version, **kwargs,
+        ))
 
     def _gpu_setup(self):
         state = manager.status()
+        state = {**state, "install_version": self.engine_version.currentData()}
         dialog = GpuSetupDialog(state, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -316,7 +352,7 @@ class SetupDialog(QDialog):
             "Checking the selected environment…" if checking else "Starting engine setup…"
         )
         for widget in (
-            self.python, self.browse_button, self.install_button, self.remove_button,
+            self.engine_version, self.python, self.browse_button, self.install_button, self.remove_button,
             self.existing_button, self.close_button, self.gpu_button,
         ):
             widget.setEnabled(False)
@@ -353,9 +389,13 @@ class SetupDialog(QDialog):
             selected = settings.value(manager.SETTING, "", type=str)
             if selected and any(Path(selected).absolute().is_relative_to(Path(path)) for path in result["removed"]):
                 settings.remove(manager.SETTING)
+                settings.remove(manager.VERSION_SETTING)
             self._outcome = "Private engines removed."
         else:
+            version = result["samstars_version"]
             settings.setValue(manager.SETTING, result["python"])
+            settings.setValue(manager.VERSION_SETTING, version)
+            self.engine_version.setCurrentIndex(self.engine_version.findData(version))
             self.python.clear()
             self._outcome = "Engine ready. Open Processing → Toolbox → SAMStars."
             if result.get("accelerator") in ("cuda", "mps"):

@@ -93,7 +93,7 @@ class QgisTests(unittest.TestCase):
         algorithm.initAlgorithm()
         return algorithm
 
-    def test_provider_registers_eight_tools_without_ml_imports(self):
+    def test_provider_registers_nine_tools_without_ml_imports(self):
         from samstars_qgis.provider import SamStarsProvider
         before = set(sys.modules)
         provider = SamStarsProvider()
@@ -104,11 +104,14 @@ class QgisTests(unittest.TestCase):
                 "samstars:segment", "samstars:train", "samstars:checkdependencies",
                 "samstars:alignrasters", "samstars:costsurface", "samstars:generateseeds",
                 "samstars:proposals", "samstars:refine",
+                "samstars:createtrainingwindow",
             })
             for algorithm in provider.algorithms():
                 self.assertTrue(Path(algorithm.helpUrl().split("#")[0].removeprefix("file://")).is_file())
                 if algorithm.name() in {"alignrasters", "costsurface", "generateseeds", "proposals", "refine"}:
                     self.assertEqual(algorithm.group(), "Workflow steps")
+                if algorithm.name() == "createtrainingwindow":
+                    self.assertEqual(algorithm.group(), "Training preparation")
             self.assertFalse({"torch", "tensorflow", "samstars"} & (set(sys.modules) - before))
         finally:
             registry.removeProvider(provider)
@@ -130,6 +133,109 @@ class QgisTests(unittest.TestCase):
         plugin.unload()
         plugin.unload()
         self.assertIsNone(QgsApplication.processingRegistry().providerById("samstars"))
+
+    def training_window(self, **overrides):
+        from samstars_qgis.algorithms.training_window import TrainingWindowAlgorithm
+        algorithm = TrainingWindowAlgorithm()
+        algorithm.initAlgorithm()
+        parameters = {
+            "SIZE": 50, "CRS": "EPSG:6635", "CENTER_SOURCE": 1,
+            "CENTER_X": 202591, "CENTER_Y": 2112546,
+            "OUTPUT": str(self.root / "window.gpkg"),
+        }
+        return algorithm, {**parameters, **overrides}
+
+    def test_training_window_has_exact_size_centre_and_crs_without_gui(self):
+        for size in (50, 256.5):
+            with self.subTest(size=size), patch("qgis.utils.iface", None):
+                algorithm, parameters = self.training_window(SIZE=size, OUTPUT=str(self.root / f"window-{size}.gpkg"))
+                result, ok = algorithm.run(parameters, self.context, self.feedback)
+                self.assertTrue(ok)
+                layer = QgsVectorLayer(result["OUTPUT"], "Training window", "ogr")
+                self.assertTrue(layer.isValid())
+                self.assertEqual(layer.crs().authid(), "EPSG:6635")
+                self.assertEqual(layer.featureCount(), 1)
+                feature = next(layer.getFeatures())
+                geometry = feature.geometry()
+                self.assertTrue(geometry.isGeosValid())
+                self.assertAlmostEqual(geometry.area(), size * size)
+                bounds = geometry.boundingBox()
+                self.assertAlmostEqual(bounds.xMinimum(), 202591 - size / 2)
+                self.assertAlmostEqual(bounds.xMaximum(), 202591 + size / 2)
+                self.assertAlmostEqual(bounds.yMinimum(), 2112546 - size / 2)
+                self.assertAlmostEqual(bounds.yMaximum(), 2112546 + size / 2)
+                self.assertEqual(feature["size_m"], size)
+                self.assertEqual(feature["center_x"], 202591)
+                self.assertEqual(feature["center_y"], 2112546)
+
+    def test_training_window_transforms_current_map_view_centre(self):
+        from qgis.core import QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsRectangle
+        algorithm, parameters = self.training_window(CENTER_SOURCE=0, CENTER_X=None, CENTER_Y=None)
+        map_crs = QgsCoordinateReferenceSystem("EPSG:4326")
+        extent = QgsRectangle(-156, 19, -155, 20)
+        iface = MagicMock()
+        iface.mapCanvas.return_value.extent.return_value = extent
+        iface.mapCanvas.return_value.mapSettings.return_value.destinationCrs.return_value = map_crs
+        expected = QgsCoordinateTransform(
+            map_crs, QgsCoordinateReferenceSystem("EPSG:6635"), self.context.transformContext(),
+        ).transform(extent.center())
+        with patch("qgis.utils.iface", iface):
+            result, ok = algorithm.run(parameters, self.context, self.feedback)
+        self.assertTrue(ok)
+        layer = QgsVectorLayer(result["OUTPUT"], "Training window", "ogr")
+        center = next(layer.getFeatures()).geometry().centroid().asPoint()
+        self.assertAlmostEqual(center.x(), expected.x(), places=6)
+        self.assertAlmostEqual(center.y(), expected.y(), places=6)
+        self.assertAlmostEqual(layer.extent().width(), 50)
+        self.assertAlmostEqual(layer.extent().height(), 50)
+        self.assertTrue(algorithm.flags() & Qgis.ProcessingAlgorithmFlag.NoThreading)
+
+    def test_training_window_uses_project_crs_and_loads_as_outline(self):
+        from qgis.core import QgsCoordinateReferenceSystem, QgsProcessingOutputLayerDefinition, QgsProcessingUtils
+        self.project.setCrs(QgsCoordinateReferenceSystem("EPSG:6635"))
+        algorithm, parameters = self.training_window(
+            CRS="ProjectCrs", OUTPUT=QgsProcessingOutputLayerDefinition("TEMPORARY_OUTPUT", self.project),
+        )
+        result, ok = algorithm.run(parameters, self.context, self.feedback)
+        self.assertTrue(ok)
+        layer = QgsProcessingUtils.mapLayerFromString(result["OUTPUT"], self.context)
+        self.assertEqual(layer.crs(), self.project.crs())
+        self.assertIn(result["OUTPUT"], self.context.layersToLoadOnCompletion())
+        # The algorithm clone has gone away; the output must retain its outline.
+        gc.collect()
+        self.assertEqual(layer.renderer().symbol().symbolLayer(0).properties()["style"], "no")
+
+    def test_training_window_rejects_missing_map_view(self):
+        algorithm, parameters = self.training_window(CENTER_SOURCE=0)
+        with patch("qgis.utils.iface", None), self.assertRaisesRegex(QgsProcessingException, "Open a QGIS map view"):
+            algorithm.processAlgorithm(parameters, self.context, self.feedback)
+        self.assertFalse(Path(parameters["OUTPUT"]).exists())
+
+    def test_training_window_rejects_invalid_measurements_before_writing(self):
+        invalid = (
+            {"SIZE": 0}, {"SIZE": -1}, {"SIZE": float("nan")}, {"SIZE": float("inf")},
+            {"CRS": "EPSG:4326"}, {"CRS": "EPSG:2263"}, {"CRS": "EPSG:4978"}, {"CRS": "invalid"},
+            {"CENTER_X": None}, {"CENTER_Y": None}, {"CENTER_X": ""}, {"CENTER_Y": "north"},
+            {"CENTER_X": float("nan")}, {"CENTER_Y": float("inf")}, {"CENTER_SOURCE": 8},
+        )
+        for index, overrides in enumerate(invalid):
+            with self.subTest(overrides=overrides):
+                algorithm, parameters = self.training_window(**overrides, OUTPUT=str(self.root / f"invalid-{index}.gpkg"))
+                with self.assertRaises(QgsProcessingException):
+                    algorithm.processAlgorithm(parameters, self.context, self.feedback)
+                self.assertFalse(Path(parameters["OUTPUT"]).exists())
+
+    def test_training_window_allows_zero_coordinates_and_cancellation(self):
+        from qgis.core import QgsProperty
+        algorithm, parameters = self.training_window(CENTER_X=QgsProperty.fromExpression("100 - 100"), CENTER_Y=0)
+        self.feedback.cancel()
+        self.assertEqual(algorithm.processAlgorithm(parameters, self.context, self.feedback), {})
+        self.assertFalse(Path(parameters["OUTPUT"]).exists())
+        result, ok = algorithm.run(parameters, self.context, QgsProcessingFeedback())
+        self.assertTrue(ok)
+        layer = QgsVectorLayer(result["OUTPUT"], "Training window", "ogr")
+        self.assertEqual(layer.extent().center().x(), 0)
+        self.assertEqual(layer.extent().center().y(), 0)
 
     def test_segment_passes_model_defaults_and_loads_result(self):
         algorithm = self.segment()
@@ -379,10 +485,15 @@ class QgisTests(unittest.TestCase):
         self.assertTrue(seeds.isEditable())
         self.assertEqual(payload["device"], "cpu")
         self.assertEqual(payload["crop_smooth_sigma"], 1.5)
+        self.assertIs(payload["fast"], True)
         self.assertNotIn("rgb_bands", payload)
         self.assertNotIn("smooth_sigma", payload)
         self.assertNotIn("den", payload)
         self.assertIn("prob.tif", self.context.layersToLoadOnCompletion())
+        with patch("samstars_qgis.algorithms.common.call_engine", return_value=outputs) as engine:
+            _, ok = algorithm.run({**params, "FAST": False}, self.context, self.feedback)
+        self.assertTrue(ok)
+        self.assertIs(engine.call_args.args[1]["fast"], False)
 
     def test_proposals_reject_empty_seed_selection(self):
         from samstars_qgis.algorithms.steps import ProposalsAlgorithm
@@ -436,8 +547,8 @@ class QgisTests(unittest.TestCase):
             self.assertTrue(dialog.advanced.isCollapsed())
             self.assertIn(dialog.install_button.text(), ("Install engine", "Repair engine"))
             self.assertEqual(dialog.remove_button.text(), "Remove engine")
-            from qgis.PyQt.QtWidgets import QLabel
-            self.assertFalse(any("0.2.0" in label.text() for label in dialog.findChildren(QLabel)))
+            self.assertEqual([dialog.engine_version.itemText(i) for i in range(dialog.engine_version.count())],
+                             ["Stable — 0.2.0", "Experimental — 0.3.0a1"])
             self.assertIsNone(dialog._thread)
             self.assertTrue(dialog.gpu_button.isEnabled())
         finally:
@@ -455,6 +566,89 @@ class QgisTests(unittest.TestCase):
                 self.assertIn("Unsupported platform", dialog.details.text())
             finally:
                 dialog.close()
+
+    def test_version_defaults_to_stable_and_reopens_on_the_selected_engine(self):
+        from samstars_qgis.setup_dialog import SetupDialog
+        state = {"installed": False, "managed": False, "python": "", "path": "/tmp/engines",
+                 "platform": "Linux x86_64", "removable": False, "override": False, "error": ""}
+        for version in (None, "0.2.0", "0.3.0a1"):
+            with self.subTest(version=version), patch("samstars_qgis.setup_dialog.manager.status", return_value={
+                **state, "installed": version is not None, "samstars_version": version,
+            }):
+                dialog = SetupDialog()
+                try:
+                    self.assertEqual(dialog.engine_version.currentData(), version or "0.2.0")
+                    if version:
+                        self.assertIn("SAMStars " + version, dialog.summary.text())
+                finally:
+                    dialog.close()
+
+    def test_changing_version_or_failed_setup_keeps_active_engine_and_pending_choice(self):
+        from samstars_qgis.setup_dialog import SetupDialog
+        state = {"installed": True, "managed": True, "python": "/tmp/stable/bin/python",
+                 "path": "/tmp/engines", "platform": "Linux x86_64", "removable": True,
+                 "override": False, "error": "", "samstars_version": "0.2.0", "accelerator": "cuda"}
+        with patch("samstars_qgis.setup_dialog.manager.status", return_value=state):
+            dialog = SetupDialog()
+            try:
+                with patch("samstars_qgis.setup_dialog.QgsSettings") as settings, \
+                     patch("samstars_qgis.setup_dialog.manager.install_engine") as installer:
+                    dialog.engine_version.setCurrentIndex(dialog.engine_version.findData("0.3.0a1"))
+                    self.assertIn("for testing", dialog.version_hint.text())
+                    dialog._failed("Alpha validation failed.", False)
+                    dialog._finished()
+                    settings.assert_not_called()
+                    installer.assert_not_called()
+                self.assertEqual(dialog.engine_version.currentData(), "0.3.0a1")
+                self.assertIn("SAMStars 0.2.0", dialog.summary.text())
+                self.assertIn("stable/bin/python", dialog.location.text())
+            finally:
+                dialog.close()
+
+    def test_gpu_install_uses_the_version_selected_in_setup(self):
+        from samstars_qgis.setup_dialog import SetupDialog
+        from qgis.PyQt.QtWidgets import QDialog
+        dialog = SetupDialog()
+        try:
+            dialog.engine_version.setCurrentIndex(dialog.engine_version.findData("0.3.0a1"))
+            with patch("samstars_qgis.setup_dialog.GpuSetupDialog") as gpu_dialog, \
+                 patch("samstars_qgis.setup_dialog.manager.install_engine") as installer, \
+                 patch.object(dialog, "_start", side_effect=lambda operation, **kwargs: operation()):
+                gpu_dialog.return_value.exec.return_value = QDialog.DialogCode.Accepted
+                gpu_dialog.return_value.device.currentData.return_value = "cuda"
+                gpu_dialog.return_value.operation = "install"
+                dialog._gpu_setup()
+                self.assertEqual(gpu_dialog.call_args.args[0]["install_version"], "0.3.0a1")
+                self.assertEqual(installer.call_args.kwargs["samstars_version"], "0.3.0a1")
+                self.assertEqual(installer.call_args.kwargs["accelerator"], "cuda")
+        finally:
+            dialog.close()
+
+    def test_existing_environment_detects_alpha_and_updates_the_version_selection(self):
+        from samstars_qgis.setup_dialog import SetupDialog
+        from samstars_qgis.runtime import manager
+        dialog = SetupDialog()
+        try:
+            dialog.engine_version.setCurrentIndex(dialog.engine_version.findData("0.2.0"))
+            dialog.python.setText("/tmp/alpha/bin/python")
+            with patch("samstars_qgis.setup_dialog.manager.check_engine", return_value={
+                "python": "/tmp/alpha/bin/python", "samstars_version": "0.3.0a1", "ready": True,
+            }) as check, patch("samstars_qgis.setup_dialog.QgsSettings") as settings, \
+                 patch.object(dialog, "_start", side_effect=lambda operation, **kwargs: dialog._succeeded(operation())):
+                dialog._existing()
+                check.assert_called_once_with("/tmp/alpha/bin/python")
+                settings.return_value.setValue.assert_any_call(manager.VERSION_SETTING, "0.3.0a1")
+                self.assertEqual(dialog.engine_version.currentData(), "0.3.0a1")
+        finally:
+            dialog.close()
+
+    def test_cached_external_version_belongs_to_the_saved_interpreter(self):
+        from samstars_qgis.runtime import manager
+        values = {manager.SETTING: "/tmp/alpha/bin/python", manager.VERSION_SETTING: "0.3.0a1"}
+        with patch("qgis.core.QgsSettings") as settings:
+            settings.return_value.value.side_effect = lambda key, default, **kwargs: values.get(key, default)
+            self.assertEqual(manager.saved_engine_version("/tmp/alpha/bin/python"), "0.3.0a1")
+            self.assertIsNone(manager.saved_engine_version("/tmp/stable/bin/python"))
 
     def test_gpu_dialog_explains_refinement_and_respects_environment_override(self):
         from samstars_qgis.setup_dialog import GpuSetupDialog
@@ -492,6 +686,10 @@ class QgisTests(unittest.TestCase):
                  patch.object(dialog, "_start", side_effect=lambda operation: operation()):
                 dialog._install()
                 self.assertEqual(installer.call_args.kwargs["accelerator"], "cuda")
+                dialog.engine_version.setCurrentIndex(dialog.engine_version.findData("0.3.0a1"))
+                dialog._install()
+                self.assertEqual(installer.call_args.kwargs["accelerator"], "cuda")
+                self.assertEqual(installer.call_args.kwargs["samstars_version"], "0.3.0a1")
                 dialog._install(accelerator="cpu")
                 self.assertEqual(installer.call_args.kwargs["accelerator"], "cpu")
         finally:
@@ -538,10 +736,11 @@ class QgisTests(unittest.TestCase):
         dialog = SetupDialog()
         try:
             with patch("samstars_qgis.setup_dialog.QgsSettings") as settings:
-                dialog._succeeded({"python": "/tmp/validated/bin/python"})
-                settings.return_value.setValue.assert_called_once_with(
-                    manager.SETTING, "/tmp/validated/bin/python",
-                )
+                dialog._succeeded({"python": "/tmp/validated/bin/python", "samstars_version": "0.3.0a1"})
+                settings.return_value.setValue.assert_any_call(manager.SETTING, "/tmp/validated/bin/python")
+                settings.return_value.setValue.assert_any_call(manager.VERSION_SETTING, "0.3.0a1")
+                self.assertEqual(settings.return_value.setValue.call_count, 2)
+                self.assertEqual(dialog.engine_version.currentData(), "0.3.0a1")
             dialog._finished()
             self.assertEqual(dialog.progress_bar.value(), 100)
             self.assertIn("Engine ready", dialog.message.text())
@@ -563,6 +762,7 @@ class QgisTests(unittest.TestCase):
                 state["override"] = True
                 dialog._refresh()
                 self.assertFalse(dialog.install_button.isEnabled())
+                self.assertFalse(dialog.engine_version.isEnabled())
                 self.assertFalse(dialog.existing_button.isEnabled())
                 self.assertFalse(dialog.remove_button.isEnabled())
                 self.assertIn("SAMSTARS_PYTHON", dialog.message.text())
@@ -578,7 +778,7 @@ class QgisTests(unittest.TestCase):
         def operation(*, event, cancel):
             event({"type": "progress", "value": 45, "message": "Installing libraries"})
             event({"type": "log", "message": "Validation passed"})
-            return {"python": "/tmp/validated/bin/python"}
+            return {"python": "/tmp/validated/bin/python", "samstars_version": "0.3.0a1"}
 
         try:
             with patch("samstars_qgis.setup_dialog.QgsSettings") as settings:
@@ -587,9 +787,9 @@ class QgisTests(unittest.TestCase):
                 while dialog._thread is not None and time.monotonic() < deadline:
                     QTest.qWait(10)
                 self.assertIsNone(dialog._thread)
-                settings.return_value.setValue.assert_called_once_with(
-                    manager.SETTING, "/tmp/validated/bin/python",
-                )
+                settings.return_value.setValue.assert_any_call(manager.SETTING, "/tmp/validated/bin/python")
+                settings.return_value.setValue.assert_any_call(manager.VERSION_SETTING, "0.3.0a1")
+                self.assertEqual(settings.return_value.setValue.call_count, 2)
                 self.assertEqual(dialog.progress_bar.value(), 100)
                 self.assertIn("Validation passed", dialog.log.toPlainText())
         finally:
@@ -613,6 +813,7 @@ class QgisTests(unittest.TestCase):
         try:
             with patch("samstars_qgis.setup_dialog.QgsSettings") as settings:
                 dialog._start(operation)
+                self.assertFalse(dialog.engine_version.isEnabled())
                 dialog.reject()
                 deadline = time.monotonic() + 5
                 while dialog._thread is not None and time.monotonic() < deadline:
@@ -636,7 +837,9 @@ class QgisTests(unittest.TestCase):
             with patch("samstars_qgis.setup_dialog.QgsSettings") as settings:
                 settings.return_value.value.return_value = "/tmp/private-engine/bin/python"
                 dialog._succeeded({"removed": ["/tmp/private-engine"]})
-                settings.return_value.remove.assert_called_once_with(manager.SETTING)
+                settings.return_value.remove.assert_any_call(manager.SETTING)
+                settings.return_value.remove.assert_any_call(manager.VERSION_SETTING)
+                self.assertEqual(settings.return_value.remove.call_count, 2)
             with patch("samstars_qgis.setup_dialog.QgsSettings") as settings:
                 settings.return_value.value.return_value = "/tmp/external-env/bin/python"
                 dialog._succeeded({"removed": ["/tmp/private-engine"]})

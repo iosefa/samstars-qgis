@@ -336,6 +336,35 @@ class ScientificStepTests(unittest.TestCase):
             result = self.run_step("proposals", "proposals-out", seeds=self.points(), model=str(self.root / "model"))
         self.assertTrue(Path(result["PROPOSAL_RECORDS"]).is_file())
 
+    def test_proposal_batching_defaults_and_saved_window_settings(self):
+        settings = {"version": 1, "resolution_m": 1, "sam_window_size_px": 32,
+                    "sam_window_size_m": 32, "sam_stride_px": 24, "sam_encoder_size": 1024,
+                    "padding": "constant_zero", "rgb_scaling": "valid_percentile_2_98",
+                    "stardist_patch_size_px": 32}
+        for current in (False, True):
+            model = types.SimpleNamespace(defaults={}, decoder_path=self.root / "decoder.pth")
+            if current:
+                model.preprocessing = settings
+            for fast in (None, False, True):
+                with self.subTest(current=current, fast=fast):
+                    expected = True if fast is None else fast
+
+                    def infer(records_path, out, checkpoint, **kwargs):
+                        self.assertIs(kwargs["fast"], expected)
+                        if current:
+                            self.assertEqual(kwargs["preprocessing"], settings)
+                        else:
+                            self.assertNotIn("preprocessing", kwargs)
+                        out.mkdir()
+                        records = [{key: self.payload["chm" if key == "chm" else "cost"] for key in steps.RASTER_FIELDS}]
+                        (out / "proposal_records.json").write_text(json.dumps(records))
+
+                    with patch.object(steps, "_model", return_value=model), \
+                         patch("samstars.segmentation.proposals.run_tile_proposals", side_effect=infer):
+                        self.run_step("proposals", f"proposals-{current}-{fast}",
+                                      seeds=self.points(), model=str(self.root / "model"),
+                                      **({} if fast is None else {"fast": fast}))
+
     def test_real_stardist_refinement_uses_saved_proposals_without_sam(self):
         import geopandas as gpd
         from samstars.api import _BUNDLE_FORMAT

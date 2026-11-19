@@ -16,6 +16,7 @@ import traceback
 
 PROTOCOL = 1
 SAMSTARS_VERSION = "0.2.0"
+SAMSTARS_VERSIONS = {SAMSTARS_VERSION: "Stable", "0.3.0a1": "Experimental"}
 PROFILE_FILE = ".samstars-runtime.json"
 _DLL_HANDLES = []
 
@@ -40,9 +41,23 @@ def emit(message, value=None):
     print(json.dumps(event), flush=True)
 
 
-def check_dependencies():
+def validate_version(version, expected=None):
+    if expected is not None and expected not in SAMSTARS_VERSIONS:
+        raise ValueError(f"Unsupported engine version: {expected}.")
+    if version not in SAMSTARS_VERSIONS:
+        raise RuntimeError(
+            f"Found samstars {version}; supported engine versions are "
+            + ", ".join(SAMSTARS_VERSIONS) + ". Choose a supported version in SAMStars Setup."
+        )
+    if expected is not None and version != expected:
+        raise RuntimeError(f"Expected samstars=={expected}; found {version}.")
+    return version
+
+
+def check_dependencies(expected_version=None):
     checks = []
     modules = {}
+    samstars_version = ""
     for distribution, module in (
         ("samstars", "samstars"), ("torch", "torch"),
         ("torchvision", "torchvision"), ("tensorflow", "tensorflow"),
@@ -54,8 +69,9 @@ def check_dependencies():
     ):
         try:
             version = importlib.metadata.version(distribution)
-            if distribution == "samstars" and version != SAMSTARS_VERSION:
-                raise RuntimeError(f"Found {version}; this plugin requires samstars=={SAMSTARS_VERSION}.")
+            if distribution == "samstars":
+                samstars_version = version
+                validate_version(version, expected_version)
             modules[distribution] = importlib.import_module(module)
             if distribution == "tensorflow":
                 # A CPU validation must also stay on CPU with a Metal plugin.
@@ -109,7 +125,8 @@ def check_dependencies():
             checks.append({"name": "Geospatial operations", "version": "", "ok": True, "error": ""})
         except Exception as exc:
             checks.append({"name": "Geospatial operations", "version": "", "ok": False, "error": str(exc)})
-    return {"ready": all(item["ok"] for item in checks), "checks": checks, "python_version": sys.version.split()[0]}
+    return {"ready": all(item["ok"] for item in checks), "checks": checks,
+            "python_version": sys.version.split()[0], "samstars_version": samstars_version}
 
 
 def _torch_gpu_operations(torch, device):
@@ -249,15 +266,15 @@ def run_job(operation, payload):
     if not (3, 10) <= sys.version_info[:2] <= (3, 12):
         raise RuntimeError("The SAMStars engine requires Python 3.10–3.12.")
     if operation == "check":
-        return check_dependencies()
+        return check_dependencies(payload.get("samstars_version"))
     if operation == "check_gpu":
         return check_gpu(payload.get("device"))
     step_operations = {"alignrasters", "costsurface", "generateseeds", "proposals", "refine"}
     if operation not in {"train", "segment", *step_operations}:
         raise ValueError(f"Unknown operation: {operation}")
     version = importlib.metadata.version("samstars")
-    if version != SAMSTARS_VERSION:
-        raise RuntimeError(f"This plugin requires samstars=={SAMSTARS_VERSION}; found {version}.")
+    validate_version(version)
+    emit(f"Using SAMStars {version}.")
     if operation in step_operations:
         if __package__:
             steps = importlib.import_module(".steps", __package__)
@@ -278,7 +295,7 @@ def run_job(operation, payload):
         model = samstars.SamStars.load(Path(arguments["model"]))
         defaults = model.defaults
         if model.manifest.get("bundle_version") != 1:
-            raise ValueError("Unsupported model bundle version; use a SAMStars 0.2.0 bundle.")
+            raise ValueError("Unsupported model bundle version; use a SAMStars bundle with bundle_version 1.")
     validate_rasters(arguments, defaults)
     for name in ("img", "chm", "den", "model", "sam_base_ckpt", "crowns"):
         if name in arguments:

@@ -14,7 +14,9 @@ Scientific libraries run in a separate Python
    `dist/samstars_qgis.zip`.
 2. In QGIS, open **Plugins → Manage and Install Plugins → Install from ZIP**,
    select that ZIP, and enable **SAMStars**.
-3. Open **Plugins → SAMStars → Set up SAMStars** and click **Install engine**.
+3. Open **Plugins → SAMStars → Set up SAMStars**, choose **Engine version**, and
+   click **Install engine**. **Stable — 0.2.0** is the default;
+   **Experimental — 0.3.0a1** opts into the alpha for testing.
    Setup detects an installed Python 3.10–3.12. Open **Advanced** to choose a
    Python executable yourself or select a prepared SAMStars environment with
    **Use existing environment**. Setup shows status and progress in the main
@@ -42,6 +44,22 @@ they can select an existing environment, but this plugin does not promise
 working scientific packages on those platforms. No portable Python, models,
 checkpoints, or GPU runtimes are bundled. CPU setup pins SAMStars itself;
 transitive dependencies resolve within its published constraints.
+
+### Change engine version
+
+Install the updated plugin ZIP and restart QGIS. In **Set up SAMStars**, choose
+**Experimental — 0.3.0a1**, then click **Repair engine** (or **Install engine** if
+no private engine is selected). Repair uses the selected version and preserves
+the private engine's CPU/NVIDIA/Apple GPU profile. GPU setup also uses this version
+choice. Installation creates a new environment and downloads its dependencies;
+the current environment remains selected until validation succeeds, and is kept
+afterwards. Changing the dropdown alone does not switch the active engine.
+
+The setup summary shows the selected engine's version. To reuse a retained engine
+without reinstalling, select its Python under **Advanced → Use existing environment**;
+the plugin detects and validates either supported version. Failed or canceled
+installs leave the previous selection in place. Both releases retain the same
+Python 3.10–3.12 requirement and GPU setup policy.
 
 ## Optional GPU setup
 
@@ -117,6 +135,7 @@ as a QGIS plugin. Restart QGIS after updating the plugin.
 | --- | --- | --- |
 | Segment tree crowns | `samstars:segment` | Crown GeoPackage, automatically loaded into the project |
 | Train a model | `samstars:train` | Reusable model bundle folder |
+| Create training window | `samstars:createtrainingwindow` | Square polygon guide for labeling crowns |
 | Align input rasters | `samstars:alignrasters` | Selected rasters aligned to a user-chosen reference grid |
 | Build cost surface | `samstars:costsurface` | Boundary-cost raster |
 | Generate seed points | `samstars:generateseeds` | Editable seed GeoPackage |
@@ -125,6 +144,7 @@ as a QGIS plugin. Restart QGIS after updating the plugin.
 | Check SAMStars dependencies | `samstars:checkdependencies` | HTML report and `READY` boolean |
 
 **Tree crowns** contains the full segmentation and training workflows.
+**Training preparation** contains the training-window guide tool.
 **Workflow steps** contains the five independent steps. **Setup** contains
 the dependency check. Segment tree crowns still handles alignment, cost
 construction, seed generation, SAM proposals, and refinement automatically.
@@ -142,6 +162,19 @@ To **segment**, choose a trained SAMStars bundle directory containing
 `manifest.json`, then select a new output folder. The result is
 `OUTPUT/crowns/crowns.gpkg`, also returned as the `CROWNS` Processing output.
 Band choices come from the bundle unless overridden in Advanced parameters.
+
+To prepare hand-drawn labels, run **Training preparation → Create training
+window**. Enter the square's side length in metres and choose a projected CRS
+in metres, preferably the imagery CRS. Place it at the **centre of the current
+map view**, or enter **X and Y in the window CRS**. Map-view coordinates are
+transformed automatically. The default side length is 256 m; for example,
+that covers 512 pixels per side at 0.5 m resolution.
+
+Save the window to a GeoPackage to keep it. QGIS displays it as an outline so
+you can create a separate polygon layer and trace one polygon per crown
+inside it. Fully annotate the area and **crop the training rasters to it**
+before training. The guide alone does not crop rasters, snap to pixels, or
+set the model's SAM processing window. It needs no SAMStars engine.
 
 To **train**, also select one polygon per labeled crown and a local
 **SAM ViT-L** checkpoint (`sam_vit_l_0b3195.pth`, available from the
@@ -244,10 +277,11 @@ QT_QPA_PLATFORM=offscreen /usr/bin/python3 -m unittest discover -s tests -p 'tes
 python3 scripts/package_plugin.py
 ```
 
-Use a QGIS-enabled Python for the second command. The current integration tests
+Use a QGIS-enabled Python for the third command. The current integration tests
 pass on **QGIS 4.2.3 / Qt 6.11.2**. They cover the setup dialog, background work
 and cancellation, menu lifecycle, Processing parameters, registration, and
-polygon/seed export, and independent step dialogs. Scientific step tests also
+polygon/seed export, independent step dialogs, and training-window geometry and
+placement. Scientific step tests also
 run in a SAMStars environment. The plugin's startup guard rejects QGIS 3.x. A fresh private
 CUDA 12.8 engine passed installation, CPU/geospatial checks, and real GPU
 operations on an RTX 5090. **Full model training/inference and installation on

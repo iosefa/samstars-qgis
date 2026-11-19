@@ -16,9 +16,10 @@ QT_QPA_PLATFORM=offscreen /usr/bin/python3 -m unittest discover -s tests -p 'tes
 These test actual Processing registration, input validation, selection-aware
 polygon/seed export, unsaved seed moves, output loading, individual step
 parameters and defaults, setup construction, and the minimum-version
-guard. Neural model calls are substituted at the engine boundary. The shared
-Processing APIs can be checked with QGIS 3.44, but plugin startup requires 4.0.
-The Qt6 menu lifecycle test runs only on QGIS 4+. The setup tests also cover
+guard. Training-window checks cover square size and placement, CRS conversion
+from the map view, invalid coordinates and units, and outline styling.
+Neural model calls are substituted at the engine boundary. Use QGIS 4.0 or
+later, including for the Qt6 menu lifecycle check. The setup tests also cover
 collapsed Advanced controls, install/repair status, asynchronous progress,
 failure messages, closing during work, and removal of the selected engine.
 

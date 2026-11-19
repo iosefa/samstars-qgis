@@ -12,9 +12,10 @@ import uuid
 
 from .client import EngineCanceled, EngineError, call_with_python, run_process
 from . import accelerators
-from .worker import PROFILE_FILE, SAMSTARS_VERSION
+from .worker import PROFILE_FILE, SAMSTARS_VERSION, SAMSTARS_VERSIONS
 
 SETTING = "samstars/engine_python"
+VERSION_SETTING = "samstars/engine_version"
 MARKER = ".samstars-engine.json"
 OWNER = {"owner": "org.samstars.qgis.engine", "schema": 1}
 
@@ -104,6 +105,7 @@ def status():
         "error": "",
         "warning": "",
         "accelerator": "cpu",
+        "samstars_version": None,
     }
     try:
         generations = owned_engines(root)
@@ -112,15 +114,24 @@ def status():
             Path(python).absolute().is_relative_to(path.absolute()) for path in generations
         ))
         if result["managed"]:
+            # Engines installed before version selection were pinned to stable.
+            result["samstars_version"] = SAMSTARS_VERSION
             profile = Path(python).parent.parent / PROFILE_FILE
             if profile.is_file():
                 try:
                     saved = json.loads(profile.read_text(encoding="utf-8"))
                     if saved["device"] not in ("cpu", "cuda", "mps") or saved["refinement"] != "cpu":
                         raise ValueError("Unsupported engine profile")
+                    version = saved.get("samstars_version", SAMSTARS_VERSION)
+                    if version not in SAMSTARS_VERSIONS:
+                        raise ValueError("Unsupported engine version")
                     result["accelerator"] = saved["device"]
+                    result["samstars_version"] = version
                 except (OSError, ValueError, TypeError, KeyError):
+                    result["samstars_version"] = None
                     result["warning"] = "Private engine settings are invalid. Repair will build a CPU engine; GPU setup can select a GPU profile."
+        elif result["installed"] and not result["override"]:
+            result["samstars_version"] = saved_engine_version(python)
         if not supported_platform():
             result["error"] = (
                 "Automatic installation supports Linux x64 and Apple Silicon macOS. "
@@ -138,6 +149,18 @@ def engine_python():
         SETTING, "", type=str
     )
     return str(Path(value).expanduser().absolute()) if value else None
+
+
+def saved_engine_version(python):
+    """Return the last validated version only for its saved interpreter."""
+    from qgis.core import QgsSettings
+
+    settings = QgsSettings()
+    selected = settings.value(SETTING, "", type=str)
+    if not selected or str(Path(selected).expanduser().absolute()) != python:
+        return None
+    version = settings.value(VERSION_SETTING, "", type=str)
+    return version if version in SAMSTARS_VERSIONS else None
 
 
 def suggested_python():
@@ -166,9 +189,10 @@ def check_python(python, *, cancel=None):
     return python
 
 
-def check_engine(python, *, event=None, cancel=None):
+def check_engine(python, *, samstars_version=None, event=None, cancel=None):
     python = check_python(python, cancel=cancel)
-    result = call_with_python(python, "check", {}, cancel=cancel, event=event, timeout=300)
+    payload = {} if samstars_version is None else {"samstars_version": samstars_version}
+    result = call_with_python(python, "check", payload, cancel=cancel, event=event, timeout=300)
     if not result.get("ready"):
         failures = [f"{item['name']}: {item['error']}" for item in result["checks"] if not item["ok"]]
         raise EngineError("The SAMStars environment is not ready.\n" + "\n".join(failures))
@@ -189,8 +213,11 @@ def check_gpu(python, device, *, event=None, cancel=None):
     return result
 
 
-def install_engine(base_python=None, root=None, *, accelerator="cpu", event=None, cancel=None):
+def install_engine(base_python=None, root=None, *, accelerator="cpu", samstars_version=SAMSTARS_VERSION,
+                   event=None, cancel=None):
     """Only return a new interpreter after validating it; preserve existing engines."""
+    if samstars_version not in SAMSTARS_VERSIONS:
+        raise EngineError("Choose a supported engine version in SAMStars Setup.")
     if not supported_platform():
         raise EngineError(
             "Automatic installation supports Linux x64 and Apple Silicon macOS. "
@@ -210,10 +237,12 @@ def install_engine(base_python=None, root=None, *, accelerator="cpu", event=None
     owned_engines(root)  # Reject linked roots before creating anything.
     root.mkdir(parents=True, exist_ok=True)
     with _operation_lock(root):
-        return _install_generation(base_python, root, profile=profile, event=event, cancel=cancel)
+        return _install_generation(base_python, root, profile=profile, samstars_version=samstars_version,
+                                   event=event, cancel=cancel)
 
 
-def _install_generation(base_python, root, *, profile, event=None, cancel=None):
+def _install_generation(base_python, root, *, profile, samstars_version, event=None, cancel=None):
+    profile = {**profile, "samstars_version": samstars_version}
     destination = root / ("engine-" + uuid.uuid4().hex)
     destination.mkdir()
     python = destination / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
@@ -252,18 +281,18 @@ def _install_generation(base_python, root, *, profile, event=None, cancel=None):
         elif platform.system() == "Linux":
             log("Installing CPU builds of PyTorch and Torchvision…", 15)
             execute(pip + ["torch>=2.3,<3", "torchvision>=0.18,<1", "--index-url", "https://download.pytorch.org/whl/cpu"], python)
-        log("Installing SAMStars and its dependencies…", 45)
-        execute(pip + [f"samstars=={SAMSTARS_VERSION}", "--index-url", "https://pypi.org/simple"] + requirements, python)
+        log(f"Installing SAMStars {samstars_version} and its dependencies…", 45)
+        execute(pip + [f"samstars=={samstars_version}", "--index-url", "https://pypi.org/simple"] + requirements, python)
         execute([str(python), "-I", "-m", "pip", "--isolated", "check"], python)
         log("Checking scientific libraries and CPU operations…", 85)
-        result = check_engine(str(python), event=event, cancel=cancel)
+        result = check_engine(str(python), samstars_version=samstars_version, event=event, cancel=cancel)
         if profile["device"] != "cpu":
             log("Testing GPU computation and gradients…", 95)
             result["gpu"] = check_gpu(str(python), profile["device"], event=event, cancel=cancel)
         if cancel and cancel():
             raise EngineCanceled("Engine setup canceled.")
         log("Engine ready.", 100)
-        return {**result, "accelerator": profile["device"]}
+        return {**result, "accelerator": profile["device"], "samstars_version": samstars_version}
     except BaseException:
         # This unique directory was created by this invocation only.
         shutil.rmtree(destination, ignore_errors=True)

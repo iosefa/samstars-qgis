@@ -303,7 +303,11 @@ def proposals(p, out, emit):
     _, records = build_tile_records(tiles_dir=tile.parent, out_root=out / "run_records")
     emit(f"Running SAM proposals with {len(seeds)} seed points on {device}…", 25)
     proposal_root = out / "proposals"
-    run_tile_proposals(records, proposal_root, model.decoder_path, device=device, fast=bool(p.get("fast", False)), **smoothing)
+    options = dict(smoothing)
+    preprocessing = getattr(model, "preprocessing", None)
+    if preprocessing is not None:
+        options["preprocessing"] = preprocessing
+    run_tile_proposals(records, proposal_root, model.decoder_path, device=device, fast=bool(p.get("fast", True)), **options)
     records_path = proposal_root / "proposal_records.json"
     records = read_proposal_records(records_path)
     if len(records) != 1:

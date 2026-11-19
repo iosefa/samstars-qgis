@@ -287,6 +287,26 @@ class ApiContractTests(unittest.TestCase):
         self.assertEqual(calls[0]["stardist_epochs"], 3)
         self.assertIsInstance(calls[0]["crowns"], Path)
 
+    def test_experimental_engine_can_train_without_forwarding_version_to_the_api(self):
+        def train(**kwargs):
+            self.assertNotIn("samstars_version", kwargs)
+            (kwargs["out"] / "manifest.json").write_text("{}")
+            return types.SimpleNamespace(root=kwargs["out"])
+
+        self.samstars.train = train
+        with patch.object(worker.importlib.metadata, "version", return_value="0.3.0a1"):
+            result = worker.run_job("train", {
+                **self.payload, "crowns": str(self.root / "crowns.gpkg"),
+                "sam_base_ckpt": str(self.root / "sam.pth"),
+            })
+        self.assertEqual(result["MODEL"], self.payload["out"])
+
+    def test_unknown_engine_version_fails_before_creating_output(self):
+        with patch.object(worker.importlib.metadata, "version", return_value="0.3.0a2"):
+            with self.assertRaisesRegex(RuntimeError, "supported engine versions"):
+                worker.run_job("train", self.payload)
+        self.assertFalse(Path(self.payload["out"]).exists())
+
     def test_no_crown_output_is_failure(self):
         self.samstars.segment = lambda **kwargs: types.SimpleNamespace(out=kwargs["out"], crowns=kwargs["out"] / "missing.gpkg")
         with self.assertRaisesRegex(RuntimeError, "no crown GeoPackage"):
@@ -393,6 +413,30 @@ class AcceleratorTests(unittest.TestCase):
                 worker.engine_profile()
 
 
+class VersionTests(unittest.TestCase):
+    def test_dependency_checks_report_actual_version_and_enforce_install_target(self):
+        for actual, expected, accepted in (
+            ("0.2.0", None, True), ("0.3.0a1", None, True),
+            ("0.3.0a1", "0.3.0a1", True), ("0.2.0", "0.3.0a1", False),
+            ("0.3.0a2", None, False),
+        ):
+            def distribution_version(name):
+                if name == "samstars":
+                    return actual
+                raise importlib.metadata.PackageNotFoundError(name)
+
+            with self.subTest(actual=actual, expected=expected), \
+                 patch.object(worker.importlib.metadata, "version", side_effect=distribution_version), \
+                 patch.object(worker.importlib, "import_module", return_value=types.SimpleNamespace(train=None, segment=None)), \
+                 patch.object(worker, "emit"):
+                payload = {} if expected is None else {"samstars_version": expected}
+                result = worker.run_job("check", payload)
+                self.assertEqual(result["samstars_version"], actual)
+                self.assertEqual(result["checks"][0]["ok"], accepted)
+                if expected and not accepted:
+                    self.assertIn("Expected samstars==" + expected, result["checks"][0]["error"])
+
+
 class InstallerTests(unittest.TestCase):
     def _generation(self, root, suffix="a"):
         path = root / ("engine-" + suffix * 32)
@@ -405,6 +449,46 @@ class InstallerTests(unittest.TestCase):
              patch.object(manager, "call_with_python", return_value={"ready": True, "checks": [], "python": "3.12.0"}):
             result = manager.check_engine(sys.executable)
         self.assertEqual(result["python"], sys.executable)
+
+    def test_install_checks_the_exact_requested_version(self):
+        with patch.object(manager, "check_python", return_value=sys.executable), \
+             patch.object(manager, "call_with_python", return_value={
+                 "ready": False, "checks": [{"name": "samstars", "ok": False,
+                 "error": "Expected samstars==0.3.0a1; found 0.2.0."}],
+             }) as check:
+            with self.assertRaisesRegex(client.EngineError, "Expected samstars==0.3.0a1"):
+                manager.check_engine(sys.executable, samstars_version="0.3.0a1")
+        self.assertEqual(check.call_args.args[2], {"samstars_version": "0.3.0a1"})
+
+    def test_unknown_version_is_rejected_before_installation(self):
+        with patch.object(manager, "check_python") as check, patch.object(manager, "run_process") as runner:
+            with self.assertRaisesRegex(client.EngineError, "supported engine version"):
+                manager.install_engine(samstars_version="0.3.0a2")
+            check.assert_not_called()
+            runner.assert_not_called()
+
+    def test_selected_version_is_pinned_recorded_and_validated_for_each_profile(self):
+        for version in worker.SAMSTARS_VERSIONS:
+            for device in ("cpu", "cuda", "mps"):
+                with self.subTest(version=version, device=device), tempfile.TemporaryDirectory() as directory:
+                    profile = {"device": device, "refinement": "cpu", "hardware": "test",
+                               "index": "https://download.pytorch.org/whl/cu126" if device == "cuda" else ""}
+                    with patch.object(manager, "supported_platform", return_value=True), \
+                         patch.object(manager, "check_python", return_value=sys.executable), \
+                         patch.object(accelerators, "installation_profile", return_value=profile), \
+                         patch.object(accelerators, "check_interpreter_platform"), \
+                         patch.object(manager, "run_process", return_value=(0, "")) as runner, \
+                         patch.object(manager, "check_engine", side_effect=lambda python, **kwargs: {"python": python, "ready": True}) as check, \
+                         patch.object(manager, "check_gpu", return_value={"ready": True}) as gpu:
+                        result = manager.install_engine(sys.executable, directory, accelerator=device, samstars_version=version)
+                    commands = [call.args[0] for call in runner.call_args_list]
+                    self.assertEqual(sum(f"samstars=={version}" in command for command in commands), 1)
+                    self.assertFalse(any("--pre" in command for command in commands))
+                    self.assertEqual(check.call_args.kwargs["samstars_version"], version)
+                    self.assertEqual(result["samstars_version"], version)
+                    saved = json.loads((Path(result["python"]).parent.parent / worker.PROFILE_FILE).read_text())
+                    self.assertEqual(saved, {**profile, "samstars_version": version})
+                    self.assertEqual(gpu.call_count, int(device != "cpu"))
 
     def test_rejects_unsupported_python_without_installing(self):
         with patch.object(manager, "run_process", return_value=(0, "[3, 13]")):
@@ -477,7 +561,8 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual(result["accelerator"], "cuda")
             gpu.assert_called_once()
             self.assertEqual(gpu.call_args.args, (result["python"], "cuda"))
-            self.assertEqual(json.loads((Path(result["python"]).parent.parent / worker.PROFILE_FILE).read_text()), profile)
+            self.assertEqual(json.loads((Path(result["python"]).parent.parent / worker.PROFILE_FILE).read_text()),
+                             {**profile, "samstars_version": worker.SAMSTARS_VERSION})
 
     def test_gpu_probe_failure_or_cancellation_preserves_previous_engine(self):
         for error in (client.EngineError("GPU kernel failed"), client.EngineCanceled("Canceled")):
@@ -492,7 +577,7 @@ class InstallerTests(unittest.TestCase):
                      patch.object(manager, "check_engine", return_value={"ready": True}), \
                      patch.object(manager, "check_gpu", side_effect=error):
                     with self.assertRaises(type(error)):
-                        manager.install_engine(sys.executable, root, accelerator="cuda")
+                        manager.install_engine(sys.executable, root, accelerator="cuda", samstars_version="0.3.0a1")
                 self.assertEqual(manager.owned_engines(root), [old])
                 self.assertEqual((old / "keep").read_text(), "previous engine")
 
@@ -567,12 +652,21 @@ class InstallerTests(unittest.TestCase):
                 self.assertTrue(state["managed"])
                 self.assertTrue(state["installed"])
                 self.assertTrue(state["removable"])
+                self.assertEqual(state["samstars_version"], "0.2.0")
+                (generation / worker.PROFILE_FILE).write_text(json.dumps({
+                    "device": "cuda", "refinement": "cpu", "samstars_version": "0.3.0a1",
+                }))
+                state = manager.status()
+                self.assertEqual(state["samstars_version"], "0.3.0a1")
+                self.assertEqual(state["accelerator"], "cuda")
             with patch.object(manager, "engine_root", return_value=root), \
                  patch.object(manager, "engine_python", return_value=sys.executable), \
+                 patch.object(manager, "saved_engine_version", return_value="0.3.0a1"), \
                  patch.object(manager, "supported_platform", return_value=True):
                 state = manager.status()
                 self.assertFalse(state["managed"])
                 self.assertTrue(state["installed"])
+                self.assertEqual(state["samstars_version"], "0.3.0a1")
 
     def test_broken_profile_can_still_be_repaired(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -602,7 +696,7 @@ class PackagingTests(unittest.TestCase):
             with zipfile.ZipFile(archive) as zipped:
                 names = zipped.namelist()
                 self.assertTrue(all(name.startswith("samstars_qgis/") for name in names))
-                for name in ("__init__.py", "metadata.txt", "runtime/worker.py", "runtime/steps.py", "algorithms/steps.py", "runtime/accelerators.py", "docs/index.html", "NOTICE", "LICENSE"):
+                for name in ("__init__.py", "metadata.txt", "runtime/worker.py", "runtime/steps.py", "algorithms/steps.py", "algorithms/training_window.py", "runtime/accelerators.py", "docs/index.html", "NOTICE", "LICENSE"):
                     self.assertIn("samstars_qgis/" + name, names)
                 self.assertFalse(any("__pycache__" in name or "/tests/" in name for name in names))
                 metadata = configparser.ConfigParser()
