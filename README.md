@@ -4,7 +4,7 @@ Train models and segment individual tree crowns in the **QGIS Processing
 Toolbox**. The plugin follows the PyForestScan QGIS plugin: ordinary Processing
 dialogs, batch/model support, and one small setup dialog.
 
-Requires **QGIS 4.0 or later**. Version **0.1.5 is experimental**.
+Requires **QGIS 4.0 or later**. Version **0.1.9 is experimental**.
 Scientific libraries run in a separate Python
 3.10–3.12 environment.
 
@@ -24,6 +24,12 @@ Scientific libraries run in a separate Python
 4. Run **Check SAMStars dependencies** in the Processing Toolbox. Its log and
    HTML report show import checks, small CPU operations, CRS transformation,
    and a GeoPackage round trip.
+
+On macOS, automatic detection checks standard Homebrew and Python.org locations
+even when QGIS is launched from Finder. If detection fails, open **Advanced** and
+enter a compatible Python executable (for example,
+`/opt/homebrew/bin/python3.12`), then click **Install engine**. **Use existing
+environment** is for environments that already have SAMStars installed.
 
 The private installer needs an existing Python with `venv`/`ensurepip`, internet
 access, and several GB of disk space. It creates a new environment under the
@@ -184,7 +190,56 @@ background. The plugin exports the requested polygon layer, including selected
 features/subsets and unsaved edits, to a temporary GeoPackage. The output folder
 is returned as `OUTPUT` and `MODEL`; pass it to segmentation's `MODEL` input.
 
-Advanced parameters cover RGB band order, optional NIR/texture bands, compute
+**Train a model → Advanced** contains collapsible groups. Defaults preserve the
+existing training behavior; optional overrides start disabled.
+
+| Group | Settings |
+| --- | --- |
+| Input bands and execution | RGB, optional NIR/texture, device, intermediate storage |
+| SAM windows and training | Pixel or metre windows, automatic or custom stride, epochs, minimum iterations, learning rate, extra foreground seeds |
+| Seed generation | Peak and height thresholds, search radius, smoothing, minimum cluster samples, merge radius, thinning and distance |
+| Proposal processing | Per-crop, mosaic, and post-fusion smoothing; batch prompt decoding |
+| StarDist training | Epochs, minimum iterations, optional patch size, validation fraction, input channel, auxiliary CHM, normalization, augmentation |
+| Defaults for prediction | Optional refinement windows/overlap and duplicate suppression, stored in the model bundle |
+
+Choose **SAM window units** to enable either pixels (default **512**) or metres.
+Automatic spacing is 75% of the pixel size, rounded down to at least one pixel,
+retaining approximately 25% overlap. **Custom stride** enables a pixel distance
+which must not exceed the window size. At 0.1 m resolution, 256 pixels covers
+25.6 m; the default automatic stride is then 192 pixels. Custom pixel sizes,
+metre windows, patch-size overrides, and extra foreground seed counts other
+than 80 require **Experimental SAMStars 0.3.0a1**. Stable 0.2.0 requires 512-pixel
+SAM windows, 80 extra foreground seeds, and the patch-size override off.
+The experimental engine stores window/resolution settings for prediction
+and pads images smaller than the window. Larger windows can need more memory.
+SAM's fixed 1024-pixel encoder input is unchanged.
+
+Set **Extra foreground seeds** directly under **SAM windows and training**.
+The default is **80** additional foreground prompt points per seed; **0** keeps
+only the seed as foreground. Background points and box prompts remain active.
+**Override StarDist patch size** enables a separate
+patch control, default 256; it must be a multiple of 16 and fit each training
+image. Minimum iterations default to 0 (epochs only); positive values can
+increase the effective epoch count. The default SAM learning rate is 0.00005.
+Validation defaults to 0.2 and must be below 1. It splits proposal records,
+not spatial areas; with one record, training data is reused for validation.
+
+Thinning distance is enabled only when seed thinning is checked. Refinement
+size/overlap are enabled only with tiled prediction, and overlap must be less
+than the window size. Duplicate suppression independently enables an IoU
+threshold between 0 and 1. These are saved prediction defaults, not training
+patch settings. Inactive values are ignored and retained in the open dialog
+when toggled off and back on. Batch decoding defaults to the engine's behavior
+(off in 0.2.0, on in 0.3.0a1). Normalization also applies without auxiliary CHM.
+
+During training, Processing displays SAM/StarDist epoch counts and StarDist
+batch counts with an estimated time for the **current training stage** once
+timing is available. This excludes later proposal generation, validation,
+threshold optimization, and bundle saving as applicable. Terminal color codes
+are removed from the log. A batch count such as `32/100` is not the overall
+training percentage.
+
+Advanced parameters also cover RGB band order, optional NIR/texture bands, compute
 device, intermediate storage, and training epoch counts. RGB uses one-based
 indices in red, green, blue order (training default: `1,2,3`). For segmentation,
 blank RGB and zero NIR/texture reuse the bundle settings; zero does not disable

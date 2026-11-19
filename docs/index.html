@@ -130,9 +130,54 @@
     labeled area, because unlabeled pixels are treated as background.</p>
   <p>Processing's selected-features option, layer subsets, and unsaved polygon
     edits are preserved in a temporary GeoPackage. RGB defaults to bands
-    <code>1,2,3</code>. Advanced parameters expose band choices and the SAM/StarDist
-    epoch counts. The new model folder is returned as <code>MODEL</code> and
+    <code>1,2,3</code>. The new model folder is returned as <code>MODEL</code> and
     <code>OUTPUT</code>; supply it to segmentation.</p>
+  <p><strong>Advanced</strong> contains collapsible groups with the existing
+    defaults. Optional overrides start disabled; their fields enable when the
+    related option is selected. Inactive values are ignored and retained when
+    toggled off and back on in the dialog.</p>
+  <ul>
+    <li><strong>Input bands and execution:</strong> RGB, optional NIR/texture,
+      compute device, and intermediate storage.</li>
+    <li><strong>SAM windows and training:</strong> choose pixels (default 512)
+      or metres. Automatic stride is 75% of the pixel width, rounded down to at
+      least 1; custom stride must not exceed the window. Set epochs, minimum
+      iterations (0 = epochs only), and learning rate (default 0.00005).
+      Set <strong>Extra foreground seeds</strong> directly, default 80 additional
+      foreground prompt points per seed. Set 0 for seed-only foreground prompts;
+      background points and box prompts remain active.</li>
+    <li><strong>Seed generation:</strong> peak/height thresholds, peak-search
+      radius, smoothing, minimum cluster samples, merge radius, and thinning.
+      Thinning distance enables only with seed thinning.</li>
+    <li><strong>Proposal processing:</strong> per-crop, mosaic, and post-fusion
+      smoothing (0 disables a stage), and batch prompt decoding. Engine default
+      preserves 0.2.0's disabled or 0.3.0a1's enabled batching.</li>
+    <li><strong>StarDist training:</strong> epochs, minimum iterations, optional
+      patch size (default 256, multiples of 16, must fit every image), validation
+      fraction, canopy index or SAM probability input, auxiliary CHM,
+      normalization, and augmentation. Normalization still applies when CHM is
+      disabled. Validation defaults to 0.2 and must be below 1; it splits records,
+      not spatial areas. With one record, training data is reused for validation.</li>
+    <li><strong>Defaults for prediction:</strong> enable tiled refinement to
+      set window size and overlap in metres; overlap must be smaller than the
+      window. Duplicate suppression independently enables an IoU threshold
+      between 0 and 1. These settings are saved for later prediction.</li>
+  </ul>
+  <p>Custom SAM pixel sizes, metre windows, patch-size overrides, and extra
+    foreground seed counts other than 80 require
+    <strong>Experimental SAMStars 0.3.0a1</strong>. Stable 0.2.0 requires 512-pixel
+    SAM windows, 80 extra foreground seeds, and the patch-size override off.
+    The experimental engine stores
+    window/resolution settings for prediction and pads images smaller than the
+    window. At 0.1 m resolution, 256 pixels covers 25.6 m with an automatic
+    192-pixel stride. Larger windows may need more memory. SAM's fixed 1024-pixel
+    encoder input is unchanged. Positive minimum-iteration values can increase
+    the effective epoch count.</p>
+  <p>Training status shows SAM/StarDist epochs and StarDist batch counts. Time
+    estimates cover the <strong>current training stage</strong> once timing is
+    available; later proposal generation, validation, threshold optimization,
+    and saving may still remain. Terminal color codes are removed from the log.
+    A batch count such as <code>32/100</code> is not overall job completion.</p>
 
   <h2 id="steps">Workflow steps</h2>
   <p>Open <strong>SAMStars → Workflow steps</strong> in the Processing Toolbox.
@@ -232,6 +277,12 @@
     It does not download or validate a trained
     model and does not certify GPU availability. A failed check includes the
     underlying error; use setup to select or install a working environment.</p>
+  <p>If setup cannot find Python, open <strong>Advanced</strong> and enter the
+    path to a Python 3.10–3.12 executable, then click <strong>Install engine</strong>.
+    On Apple Silicon Macs, a Homebrew installation commonly provides
+    <code>/opt/homebrew/bin/python3.12</code>. Automatic detection also checks
+    standard Homebrew and Python.org locations when QGIS is launched from Finder.
+    <strong>Use existing environment</strong> requires SAMStars to be installed already.</p>
   <p>For <code>No module named venv</code> or missing <code>ensurepip</code>, install
     your operating system's Python venv support or select a Python installation
     that provides it. A failed installation never replaces the selected engine.</p>

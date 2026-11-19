@@ -5,11 +5,12 @@ from pathlib import Path
 from qgis.core import (
     Qgis, QgsProcessingException, QgsProcessingOutputFolder,
     QgsProcessingParameterFeatureSource, QgsProcessingParameterFile,
-    QgsProcessingParameterNumber, QgsVectorFileWriter,
+    QgsVectorFileWriter,
     QgsProcessingUtils,
 )
 
 from .common import SamStarsAlgorithm
+from .training_parameters import add_training_parameters, training_payload
 
 
 class TrainAlgorithm(SamStarsAlgorithm):
@@ -26,7 +27,14 @@ class TrainAlgorithm(SamStarsAlgorithm):
             "Supply the SAM ViT-L checkpoint (sam_vit_l_0b3195.pth). "
             "Training polygons are exported to a temporary GeoPackage, including any Processing "
             "feature selection. RGB bands default to 1,2,3; change Advanced parameters for "
-            "another band order or optional NIR. Choose a new or empty model folder. "
+            "another band order or optional NIR. Advanced groups expose SAM windows and learning, "
+            "seed generation, proposal processing, StarDist training, and saved prediction defaults. "
+            "SAM windows default to 512 pixels with 25% overlap. Custom sizes, metre-sized windows, "
+            "patch-size overrides, and extra foreground seed counts other than 80 require SAMStars 0.3.0a1. "
+            "Extra foreground seeds defaults to 80; set 0 for seed-only foreground prompts. "
+            "Inactive fields are ignored. "
+            "Validation splits records; a single record reuses training data for validation. "
+            "Choose a new or empty model folder. "
             "The saved bundle can be used by Segment tree crowns. Training can take substantial "
             "time and memory; use the SAMStars Python API for larger tiled workflows."
         )
@@ -39,19 +47,18 @@ class TrainAlgorithm(SamStarsAlgorithm):
         self.addParameter(QgsProcessingParameterFile(
             "SAM_CHECKPOINT", "SAM ViT-L checkpoint", fileFilter="PyTorch checkpoint (*.pth *.pt)",
         ))
-        for name, label, default in (
-            ("SAM_EPOCHS", "SAM training epochs", 15),
-            ("STARDIST_EPOCHS", "StarDist training epochs", 50),
-        ):
-            self.add_advanced(QgsProcessingParameterNumber(
-                name, label, type=QgsProcessingParameterNumber.Type.Integer,
-                defaultValue=default, minValue=1,
-            ))
+        add_training_parameters(self)
         self.add_output_folder("Model bundle folder")
         self.addOutput(QgsProcessingOutputFolder("MODEL", "Trained model bundle"))
 
+    def createCustomParametersWidget(self, parent=None):
+        from .training_panel import TrainingAlgorithmWidget
+
+        return TrainingAlgorithmWidget(self, parent=parent)
+
     def processAlgorithm(self, parameters, context, feedback):
         payload = self.scene_payload(parameters, context)
+        payload.update(training_payload(self, parameters, context))
         checkpoint = Path(self.parameterAsFile(parameters, "SAM_CHECKPOINT", context)).expanduser().resolve()
         if not checkpoint.is_file():
             raise QgsProcessingException("Choose the local SAM ViT-L checkpoint file.")
@@ -87,11 +94,6 @@ class TrainAlgorithm(SamStarsAlgorithm):
         if not count:
             raise QgsProcessingException("Training requires at least one labeled crown polygon.")
         payload["crowns"] = crowns
-        for name, key in (("SAM_EPOCHS", "sam_epochs"), ("STARDIST_EPOCHS", "stardist_epochs")):
-            value = self.parameterAsInt(parameters, name, context)
-            if value < 1:
-                raise QgsProcessingException("Training epochs must be positive.")
-            payload[key] = value
         payload["out"] = self.output_path(
             parameters, context, [payload[key] for key in ("img", "chm", "den", "crowns", "sam_base_ckpt")],
         )

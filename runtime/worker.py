@@ -284,9 +284,21 @@ def run_job(operation, payload):
             steps = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(steps)
         return steps.run_step(operation, payload, emit=emit, validate_output=validate_output, claim_output=claim_output)
+    arguments = dict(payload)
+    if operation == "train":
+        if __package__:
+            training = importlib.import_module(".training", __package__)
+        else:
+            spec = importlib.util.spec_from_file_location("samstars_training_options", Path(__file__).with_name("training.py"))
+            training = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(training)
+        arguments = training.training_options(arguments, version)
+        size = arguments.get("chip_size", arguments.get("sam_window_size_m"))
+        unit = "pixels" if "chip_size" in arguments else "metres"
+        stride = arguments.get("chip_stride", "automatic")
+        emit(f"SAM training window: {size} x {size} {unit}; stride: {stride}.")
     import samstars
 
-    arguments = dict(payload)
     inputs = [arguments[key] for key in ("img", "chm", "den")]
     inputs += [arguments[key] for key in ("model", "sam_base_ckpt", "crowns") if key in arguments]
     arguments["out"] = validate_output(arguments["out"], inputs)

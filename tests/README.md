@@ -4,6 +4,7 @@ Run the standard-library tests with Python 3.10–3.12:
 
 ```bash
 python3 -m unittest discover -s tests -p 'test_runtime.py' -v
+python3 -m unittest discover -s tests -p 'test_training.py' -v
 python3 -m unittest discover -s tests -p 'test_steps.py' -v
 ```
 
@@ -67,6 +68,33 @@ the user's imagery, CHM, density, annotations, and a ViT-L checkpoint or trained
 bundle. Windows and macOS behavior require platform testing. GPU installation
 pins the framework pair, TensorFlow, and NumPy; the complete dependency graph is
 not a locked, reproducible scientific environment.
+
+Training controls have runtime and QGIS tests for Advanced grouping, conditional
+enabling and value retention, pixel/metre windows, automatic/manual stride,
+small learning-rate precision, optional overrides, API forwarding, numeric and
+cross-field validation, and the Stable 0.2.0 compatibility checks. Native dialog
+tests run offscreen with a temporary profile. On macOS, QGIS's native GUI
+initialization still requires access to WindowServer even with the offscreen
+Qt platform. These tests do not operate an existing QGIS session.
+
+Extra foreground seeds is tested as a direct, enabled numeric field with an
+80 default and explicit zero support. The stable-engine adapter preserves its
+fixed default of 80 without passing an unsupported keyword; other counts
+require the experimental engine.
+
+`test_training.py` covers option validation and deterministic stage-progress
+parsing, including ANSI codes, SAM completion counts, StarDist epoch/batch
+distinctions, missing timing, ETA, and post-training work. A runtime client test
+checks cleaned log messages and Processing status updates.
+
+With SAMStars 0.3.0a1,
+`test_custom_sam_window_reaches_real_alpha_training_chips` in `test_scientific.py`
+also exercises the real training API and chip builder on synthetic imagery.
+It verifies 256-pixel chips/masks from pixel and metre windows, automatic 192-pixel
+and custom 128-pixel strides, plus learning rate, epochs/minimum iterations,
+foreground prompts, and preprocessing patch metadata passed to the decoder.
+Preparation uses aligned fixtures; neural optimization is substituted before
+any checkpoint is loaded.
 
 For the optional real GPU test, use an existing engine environment and explicitly
 select the backend (`mps` on Apple Silicon):

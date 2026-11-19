@@ -14,6 +14,8 @@ import tempfile
 import threading
 import time
 
+from .progress import TrainingProgress, clean_log
+
 PROTOCOL = 1
 
 
@@ -228,6 +230,8 @@ def call_with_python(
             (cancel and cancel()) or (feedback is not None and feedback.isCanceled())
         )
 
+    training_progress = TrainingProgress() if operation == "train" else None
+
     def consume(line):
         try:
             message = json.loads(line)
@@ -235,9 +239,15 @@ def call_with_python(
             message = {"type": "log", "message": line}
         if not isinstance(message, dict):
             message = {"type": "log", "message": line}
+        if "message" in message:
+            message["message"] = clean_log(str(message["message"]))
         if event:
             event(message)
         if feedback is not None:
+            if training_progress is not None:
+                status = training_progress.consume(message.get("message", ""))
+                if status:
+                    feedback.setProgressText(status)
             if message.get("type") == "progress":
                 try:
                     feedback.setProgress(max(0, min(100, float(message["value"]))))

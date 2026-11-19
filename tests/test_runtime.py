@@ -10,7 +10,7 @@ import threading
 import time
 import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 import zipfile
 
 from support import ROOT
@@ -85,6 +85,26 @@ class ProcessTests(unittest.TestCase):
     def test_worker_rejects_unknown_operation(self):
         with self.assertRaisesRegex(client.EngineError, "Unknown operation"):
             client.call_with_python(sys.executable, "unsupported", {})
+
+    def test_training_feedback_strips_terminal_codes_and_shows_stage_progress(self):
+        def run(command, **kwargs):
+            kwargs["event"]("Epoch 27/50")
+            kwargs["event"]("\x1b[1m32/100\x1b[0m ===== 283ms/step - loss: 2.27")
+            kwargs["event"]('{"type":"progress","value":100,"message":"SAMStars finished."}')
+            result = Path(command[command.index("--result") + 1])
+            result.write_text(json.dumps({"protocol": 1, "ok": True, "result": {"MODEL": "model"}}))
+            return 0, ""
+
+        feedback = MagicMock()
+        feedback.isCanceled.return_value = False
+        with patch.object(client, "run_process", side_effect=run):
+            result = client.call_with_python(sys.executable, "train", {}, feedback)
+        self.assertEqual(result, {"MODEL": "model"})
+        statuses = [call.args[0] for call in feedback.setProgressText.call_args_list]
+        self.assertIn("epoch 27/50, step 32/100", statuses[1])
+        self.assertIn("bundle is saved", statuses[-1])
+        for call in feedback.pushInfo.call_args_list:
+            self.assertNotIn("\x1b", call.args[0])
 
     def test_worker_writes_structured_protocol_error(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -279,13 +299,73 @@ class ApiContractTests(unittest.TestCase):
         result = worker.run_job("train", {
             **self.payload, "crowns": str(self.root / "crowns.gpkg"),
             "sam_base_ckpt": str(self.root / "sam.pth"), "rgb_bands": [3, 2, 1],
-            "sam_epochs": 2, "stardist_epochs": 3,
+            "sam_epochs": 2, "stardist_epochs": 3, "fg_extra": 80,
         })
         self.assertEqual(result["MODEL"], self.payload["out"])
         self.assertEqual(calls[0]["rgb_bands"], (3, 2, 1))
         self.assertEqual(calls[0]["sam_epochs"], 2)
         self.assertEqual(calls[0]["stardist_epochs"], 3)
+        self.assertEqual(calls[0]["chip_size"], 512)
+        self.assertEqual(calls[0]["chip_stride"], 384)
+        self.assertNotIn("fg_extra", calls[0])
         self.assertIsInstance(calls[0]["crowns"], Path)
+
+    def test_custom_training_windows_reach_alpha_with_matching_stride(self):
+        calls = []
+
+        def train(**kwargs):
+            calls.append(kwargs)
+            (kwargs["out"] / "manifest.json").write_text("{}")
+            return types.SimpleNamespace(root=kwargs["out"])
+
+        self.samstars.train = train
+        for size, stride in ((256, 192), (500, 375), (1024, 768), (1, 1)):
+            with self.subTest(size=size), patch.object(worker.importlib.metadata, "version", return_value="0.3.0a1"):
+                worker.run_job("train", {
+                    **self.payload, "out": str(self.root / f"model-{size}"),
+                    "crowns": str(self.root / "crowns.gpkg"),
+                    "sam_base_ckpt": str(self.root / "sam.pth"), "chip_size": size,
+                })
+            self.assertEqual(calls[-1]["chip_size"], size)
+            self.assertEqual(calls[-1]["chip_stride"], stride)
+
+    def test_all_advanced_training_options_reach_the_engine(self):
+        options = {
+            "sam_window_size_m": 25.6, "chip_stride": 128, "sam_lr": .0001,
+            "sam_epochs": 2, "stardist_epochs": 3, "sam_min_iters": 5, "stardist_min_iters": 6,
+            "fg_extra": 0, "stardist_patch_size": 128, "val_fraction": .1,
+            "thin_seeds": True, "thin_dist": .4, "seed_d_min": 3.5, "seed_min_dist_px": 5,
+            "seed_gauss_sigma": 0, "seed_min_samples": 2, "seed_merge_radius": 2.5,
+            "seed_min_canopy_height": 1.5, "crop_smooth_sigma": 1.5, "smooth_sigma": 3.5,
+            "post_smooth_sigma": 1.0, "fast": False, "stardist_input_key": "file_name",
+            "stardist_use_aux": False, "stardist_normalize_inputs": False, "stardist_augment": False,
+            "stardist_window_size_m": 40.0, "stardist_window_overlap_m": 5.0, "stardist_dedup_iou_thr": .4,
+        }
+
+        def train(**kwargs):
+            for name, value in options.items():
+                self.assertEqual(kwargs[name], value, name)
+            self.assertNotIn("chip_size", kwargs)
+            (kwargs["out"] / "manifest.json").write_text("{}")
+            return types.SimpleNamespace(root=kwargs["out"])
+
+        self.samstars.train = train
+        with patch.object(worker.importlib.metadata, "version", return_value="0.3.0a1"):
+            worker.run_job("train", {**self.payload, **options})
+
+    def test_invalid_or_unsupported_training_windows_fail_before_writing(self):
+        for version, size, message in (
+            ("0.2.0", 256, "require SAMStars 0.3.0a1"),
+            ("0.2.0", 1024, "require SAMStars 0.3.0a1"),
+            *[("0.3.0a1", value, "positive integer") for value in (0, -1, 256.5, True, "256", None)],
+        ):
+            with self.subTest(version=version, size=size), \
+                 patch.object(worker.importlib.metadata, "version", return_value=version), \
+                 patch.object(self.samstars, "train", create=True) as train:
+                with self.assertRaisesRegex(ValueError, message):
+                    worker.run_job("train", {**self.payload, "chip_size": size})
+                train.assert_not_called()
+            self.assertFalse(Path(self.payload["out"]).exists())
 
     def test_experimental_engine_can_train_without_forwarding_version_to_the_api(self):
         def train(**kwargs):
@@ -435,6 +515,78 @@ class VersionTests(unittest.TestCase):
                 self.assertEqual(result["checks"][0]["ok"], accepted)
                 if expected and not accepted:
                     self.assertIn("Expected samstars==" + expected, result["checks"][0]["error"])
+
+
+class PythonDiscoveryTests(unittest.TestCase):
+    def test_mac_gui_finds_homebrew_and_python_org_without_shell_paths(self):
+        for expected in (
+            "/opt/homebrew/opt/python@3.12/bin/python3.12",
+            "/opt/homebrew/bin/python3.12",
+            "/usr/local/opt/python@3.11/bin/python3.11",
+            "/Library/Frameworks/Python.framework/Versions/3.10/bin/python3.10",
+        ):
+            version = [3, int(expected.rsplit("python3.", 1)[1])]
+            with self.subTest(python=expected), \
+                 patch.object(manager.platform, "system", return_value="Darwin"), \
+                 patch.object(manager.shutil, "which", return_value=None), \
+                 patch.object(Path, "is_file", autospec=True, side_effect=lambda path: str(path) == expected), \
+                 patch.object(manager, "run_process", return_value=(0, json.dumps(version))):
+                self.assertEqual(manager.suggested_python(), expected)
+
+    def test_discovery_skips_broken_and_unsupported_candidates(self):
+        candidates = {
+            "python3.12": "/custom/bin/python3.12",
+            "python3.11": "/custom/bin/python3.11",
+            "python3": "/custom/bin/python3",
+        }
+        with patch.object(manager.platform, "system", return_value="Linux"), \
+             patch.object(manager.shutil, "which", side_effect=candidates.get), \
+             patch.object(Path, "is_file", return_value=True), \
+             patch.object(manager, "run_process", side_effect=[
+                 client.EngineError("Could not start Python"), (0, "[3, 14]"), (0, "[3, 12]"),
+             ]) as run:
+            self.assertEqual(manager.suggested_python(), candidates["python3"])
+        self.assertEqual(run.call_count, 3)
+
+    def test_discovery_does_not_return_unsupported_qgis_python(self):
+        with patch.object(manager.platform, "system", return_value="Linux"), \
+             patch.object(manager.shutil, "which", return_value=None), \
+             patch.object(Path, "is_file", return_value=True), \
+             patch.object(manager, "run_process", return_value=(0, "[3, 14]")):
+            self.assertEqual(manager.suggested_python(), "")
+
+    def test_discovery_preserves_cancellation_during_probe(self):
+        with patch.object(manager.shutil, "which", return_value="/custom/bin/python3.12"), \
+             patch.object(Path, "is_file", return_value=True), \
+             patch.object(manager, "run_process", side_effect=client.EngineCanceled("Canceled")) as run:
+            with self.assertRaises(client.EngineCanceled):
+                manager.suggested_python()
+        run.assert_called_once()
+
+    def test_discovery_canceled_before_probe(self):
+        with patch.object(manager, "run_process") as run:
+            with self.assertRaises(client.EngineCanceled):
+                manager.suggested_python(cancel=lambda: True)
+        run.assert_not_called()
+
+    def test_no_compatible_python_does_not_create_engine(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "engines"
+            with patch.object(manager, "supported_platform", return_value=True), \
+                 patch.object(manager, "suggested_python", return_value=""), \
+                 patch.object(manager, "_install_generation") as install:
+                with self.assertRaisesRegex(client.EngineError, "No compatible Python"):
+                    manager.install_engine(root=root)
+            install.assert_not_called()
+            self.assertFalse(root.exists())
+
+    def test_explicit_python_does_not_fall_back_to_discovery(self):
+        with patch.object(manager, "supported_platform", return_value=True), \
+             patch.object(manager, "check_python", side_effect=client.EngineError("Unsupported Python")), \
+             patch.object(manager, "suggested_python") as discover:
+            with self.assertRaisesRegex(client.EngineError, "Unsupported Python"):
+                manager.install_engine("/custom/python")
+        discover.assert_not_called()
 
 
 class InstallerTests(unittest.TestCase):

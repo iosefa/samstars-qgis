@@ -163,13 +163,46 @@ def saved_engine_version(python):
     return version if version in SAMSTARS_VERSIONS else None
 
 
-def suggested_python():
-    for name in ("python3.12", "python3.11", "python3.10"):
+def _python_candidates():
+    versions = ("3.12", "3.11", "3.10")
+    for name in (f"python{version}" for version in versions):
         found = shutil.which(name)
         if found:
-            return found
-    candidate = Path(sys.prefix) / ("python.exe" if os.name == "nt" else "bin/python3")
-    return str(candidate) if candidate.is_file() else ""
+            yield Path(found)
+    if platform.system() == "Darwin":
+        # QGIS launched from Finder does not inherit the user's shell PATH.
+        # Include Homebrew's opt paths for versioned, unlinked installations.
+        for version in versions:
+            name = f"python{version}"
+            for prefix in (Path("/opt/homebrew"), Path("/usr/local")):
+                yield prefix / "opt" / f"python@{version}" / "bin" / name
+                yield prefix / "bin" / name
+            yield Path("/Library/Frameworks/Python.framework/Versions") / version / "bin" / name
+    found = shutil.which("python3")
+    if found:
+        yield Path(found)
+    yield Path(sys.prefix) / ("python.exe" if os.name == "nt" else "bin/python3")
+
+
+def suggested_python(*, cancel=None):
+    """Find a runnable supported interpreter, including outside macOS GUI PATH."""
+    seen = set()
+    for candidate in _python_candidates():
+        if cancel and cancel():
+            raise EngineCanceled("SAMStars setup was canceled.")
+        candidate = str(candidate.absolute())
+        if candidate in seen or not Path(candidate).is_file():
+            continue
+        seen.add(candidate)
+        try:
+            return check_python(candidate, cancel=cancel)
+        except EngineCanceled:
+            raise
+        except EngineError:
+            # An unavailable or unsupported first candidate must not hide a
+            # working installation later in the search.
+            continue
+    return ""
 
 
 def check_python(python, *, cancel=None):
@@ -223,13 +256,15 @@ def install_engine(base_python=None, root=None, *, accelerator="cpu", samstars_v
             "Automatic installation supports Linux x64 and Apple Silicon macOS. "
             "Select an existing SAMStars environment on other platforms."
         )
-    base_python = base_python or suggested_python()
+    base_python = check_python(base_python, cancel=cancel) if base_python else suggested_python(cancel=cancel)
     if not base_python:
         raise EngineError(
-            "No Python installation was found. Open Advanced and choose a Python "
-            "3.10–3.12 executable with venv support."
+            "No compatible Python 3.10–3.12 installation was found. Open Advanced "
+            "and choose its Python executable with venv support, or install a "
+            "supported Python first."
         )
-    base_python = check_python(base_python, cancel=cancel)
+    if event:
+        event({"type": "log", "message": "Using Python: " + base_python})
     profile = accelerators.installation_profile(accelerator, cancel=cancel)
     if accelerator != "cpu":
         accelerators.check_interpreter_platform(base_python, cancel=cancel)

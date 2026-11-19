@@ -291,6 +291,136 @@ class QgisTests(unittest.TestCase):
         with self.assertRaisesRegex(QgsProcessingException, "manifest.json"):
             self.segment().processAlgorithm(self.parameters, self.context, self.feedback)
 
+    def test_sam_training_window_is_advanced_with_default_and_minimum(self):
+        from samstars_qgis.algorithms.train import TrainAlgorithm
+        algorithm = TrainAlgorithm()
+        algorithm.initAlgorithm()
+        parameter = algorithm.parameterDefinition("SAM_WINDOW_SIZE")
+        self.assertEqual(parameter.defaultValue(), 512)
+        self.assertTrue(parameter.flags() & Qgis.ProcessingParameterFlag.Advanced)
+        self.assertFalse(parameter.checkValueIsAcceptable(0, self.context))
+        self.assertTrue(parameter.checkValueIsAcceptable(256, self.context))
+        self.assertTrue(parameter.checkValueIsAcceptable(1024, self.context))
+
+    def test_training_rejects_nonpositive_sam_window_before_export(self):
+        from samstars_qgis.algorithms.train import TrainAlgorithm
+        algorithm = TrainAlgorithm()
+        algorithm.initAlgorithm()
+        for size in (0, -1):
+            with self.subTest(size=size), patch("samstars_qgis.algorithms.common.call_engine") as engine:
+                with self.assertRaisesRegex(QgsProcessingException, "window size must be a positive"):
+                    algorithm.processAlgorithm({**self.parameters, "SAM_WINDOW_SIZE": size}, self.context, self.feedback)
+                engine.assert_not_called()
+
+    def test_training_dialog_groups_and_conditional_controls(self):
+        from samstars_qgis.algorithms.train import TrainAlgorithm
+        from samstars_qgis.algorithms.training_parameters import DEPENDENCIES, GROUPS, ORDER
+        from qgis import gui
+        from qgis.PyQt.QtWidgets import QMainWindow
+        algorithm = TrainAlgorithm()
+        algorithm.initAlgorithm()
+        parent = QMainWindow()
+        self.addCleanup(parent.deleteLater)
+        dialog = algorithm.createCustomParametersWidget(parent)
+        self.addCleanup(dialog.deleteLater)
+        base = getattr(gui, "QgsProcessingAlgorithmWidgetBase", None) or gui.QgsProcessingAlgorithmDialogBase
+        self.assertIsInstance(dialog, base)
+        panel = dialog.mainWidget()
+        self.assertEqual(set(panel.training_groups), set(GROUPS))
+        self.assertNotIn("OVERRIDE_FG_EXTRA", panel.wrappers)
+        foreground = panel.wrappers["FG_EXTRA"]
+        self.assertTrue(foreground.wrappedWidget().isEnabled())
+        self.assertEqual(foreground.parameterValue(), 80)
+        foreground.setParameterValue(0, self.context)
+        self.assertEqual(foreground.parameterValue(), 0)
+        for name in ORDER:
+            parameter = algorithm.parameterDefinition(name)
+            self.assertTrue(parameter.flags() & Qgis.ProcessingParameterFlag.Advanced)
+            self.assertEqual(panel.wrappers[name].wrappedWidget().parent(), panel.training_groups[parameter.metadata()["samstars_group"]])
+        for name, (controller, enabled_value) in DEPENDENCIES.items():
+            with self.subTest(parameter=name):
+                wrapper = panel.wrappers[name]
+                original = wrapper.parameterValue()
+                for value in (enabled_value, not enabled_value, enabled_value):
+                    if isinstance(enabled_value, int) and not isinstance(enabled_value, bool):
+                        value = int(value)
+                    panel.wrappers[controller].setParameterValue(value, self.context)
+                    self.assertEqual(wrapper.wrappedWidget().isEnabled(), value == enabled_value)
+                    self.assertEqual(wrapper.parameterValue(), original)
+        panel.wrappers["SAM_LR"].setParameterValue(.000012345, self.context)
+        self.assertAlmostEqual(panel.wrappers["SAM_LR"].parameterValue(), .000012345, places=9)
+
+    def test_training_advanced_defaults_preserve_engine_behavior(self):
+        from samstars_qgis.algorithms.train import TrainAlgorithm
+        from samstars_qgis.algorithms.training_parameters import training_payload
+        algorithm = TrainAlgorithm()
+        algorithm.initAlgorithm()
+        options = training_payload(algorithm, {}, self.context)
+        self.assertEqual(options["chip_size"], 512)
+        self.assertEqual(options["chip_stride"], 384)
+        self.assertEqual(options["sam_lr"], .00005)
+        self.assertEqual(options["val_fraction"], .2)
+        self.assertEqual(options["fg_extra"], 80)
+        self.assertEqual(options["stardist_input_key"], "index")
+        self.assertTrue(options["thin_seeds"])
+        self.assertTrue(options["stardist_use_aux"])
+        for name in ("stardist_patch_size", "fast", "sam_window_size_m", "stardist_window_size_m", "stardist_window_overlap_m", "stardist_dedup_iou_thr"):
+            self.assertNotIn(name, options)
+
+    def test_training_advanced_controls_map_active_values(self):
+        from samstars_qgis.algorithms.train import TrainAlgorithm
+        from samstars_qgis.algorithms.training_parameters import training_payload
+        algorithm = TrainAlgorithm()
+        algorithm.initAlgorithm()
+        parameters = {
+            "SAM_WINDOW_UNITS": 1, "SAM_WINDOW_METRES": 25.6, "SAM_WINDOW_SIZE": 0,
+            "SAM_STRIDE_MODE": 1, "SAM_STRIDE": 128, "SAM_LR": .0001,
+            "SAM_MIN_ITERS": 10, "STARDIST_MIN_ITERS": 20,
+            "FG_EXTRA": 0,
+            "OVERRIDE_PATCH_SIZE": True, "STARDIST_PATCH_SIZE": 128,
+            "SEED_THINNING": False, "SEED_THIN_DISTANCE": -1,
+            "STARDIST_INPUT": 1, "STARDIST_USE_AUX": False,
+            "STARDIST_NORMALIZE": False, "STARDIST_AUGMENT": False,
+            "FAST_PROPOSALS": 2, "VALIDATION_FRACTION": 0,
+            "REFINEMENT_TILING": True, "STARDIST_WINDOW_SIZE": 40, "STARDIST_OVERLAP": 5,
+            "REFINEMENT_DEDUP": True, "STARDIST_DEDUP": .4,
+        }
+        options = training_payload(algorithm, parameters, self.context)
+        expected = {
+            "sam_window_size_m": 25.6, "chip_stride": 128, "sam_lr": .0001,
+            "sam_min_iters": 10, "stardist_min_iters": 20, "fg_extra": 0,
+            "stardist_patch_size": 128, "thin_seeds": False,
+            "stardist_input_key": "file_name", "stardist_use_aux": False,
+            "stardist_normalize_inputs": False, "stardist_augment": False,
+            "fast": False, "val_fraction": 0, "stardist_window_size_m": 40,
+            "stardist_window_overlap_m": 5, "stardist_dedup_iou_thr": .4,
+        }
+        for name, value in expected.items():
+            self.assertEqual(options[name], value, name)
+        self.assertNotIn("chip_size", options)
+        self.assertNotIn("thin_dist", options)
+        options = training_payload(algorithm, {"SAM_WINDOW_SIZE": 256, "SAM_STRIDE": -1, "STARDIST_PATCH_SIZE": 17, "STARDIST_OVERLAP": -1, "STARDIST_DEDUP": 2}, self.context)
+        self.assertEqual(options["chip_stride"], 192)
+        for name in ("stardist_patch_size", "stardist_window_overlap_m", "stardist_dedup_iou_thr"):
+            self.assertNotIn(name, options)
+
+    def test_training_checks_cross_field_constraints_before_export(self):
+        from samstars_qgis.algorithms.train import TrainAlgorithm
+        algorithm = TrainAlgorithm()
+        algorithm.initAlgorithm()
+        for options, message in (
+            ({"FG_EXTRA": -1}, "Extra foreground seeds must be a nonnegative integer"),
+            ({"SAM_STRIDE_MODE": 1, "SAM_STRIDE": 513}, "stride must not exceed"),
+            ({"OVERRIDE_PATCH_SIZE": True, "STARDIST_PATCH_SIZE": 255}, "multiple of 16"),
+            ({"VALIDATION_FRACTION": 1}, "Validation fraction"),
+            ({"REFINEMENT_TILING": True, "STARDIST_WINDOW_SIZE": 50, "STARDIST_OVERLAP": 50}, "overlap must be smaller"),
+            ({"REFINEMENT_DEDUP": True, "STARDIST_DEDUP": 1}, "IoU threshold"),
+        ):
+            with self.subTest(options=options), patch("samstars_qgis.algorithms.common.call_engine") as engine:
+                with self.assertRaisesRegex(QgsProcessingException, message):
+                    algorithm.processAlgorithm({**self.parameters, **options}, self.context, self.feedback)
+                engine.assert_not_called()
+
     def test_training_exports_only_selected_edited_crowns(self):
         from samstars_qgis.algorithms.train import TrainAlgorithm
         crowns = QgsVectorLayer("Polygon?crs=EPSG:32604&field=tree_id:integer", "Labeled crowns", "memory")
@@ -324,9 +454,14 @@ class QgisTests(unittest.TestCase):
         self.assertEqual(payload["rgb_bands"], [3, 2, 1])
         self.assertEqual(payload["nir_band"], 4)
         self.assertEqual(payload["sam_epochs"], 2)
+        self.assertEqual(payload["chip_size"], 512)
         self.assertEqual(payload["storage"], "persistent")
         self.assertEqual(result["MODEL"], parameters["OUTPUT"])
         self.assertTrue(crowns.isEditable())
+        parameters["SAM_WINDOW_SIZE"] = 256
+        with patch("samstars_qgis.algorithms.common.call_engine", return_value={"MODEL": parameters["OUTPUT"]}) as engine:
+            algorithm.processAlgorithm(parameters, self.context, self.feedback)
+        self.assertEqual(engine.call_args.args[1]["chip_size"], 256)
 
     def test_canceled_algorithm_does_not_start_engine(self):
         self.feedback.cancel()
